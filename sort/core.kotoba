@@ -41,6 +41,21 @@
 (defn slurp-file [path :string] :string
   (typed-cap-call :fs/app-data :string :string path))
 
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+;; Is PATH a file this command may read? Wire 35's EXISTS form answers "1" or
+;; "0"; a path outside the granted scope answers "0", which is what the read
+;; form would trap on.
+;;
+;; This has to be ASKED. The read form TRAPS on a path it cannot serve, and a
+;; trap cannot be caught, so there is no way to notice afterwards.
+(defn readable? [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "EXISTS_SEP"))
+            "1"))
+
+
 (defn nl [] :string
   (string-substring "a
 b" 1 2))
@@ -131,4 +146,13 @@ b" 1 2))
 ;; The fixture that catches it is in the suite.
 
 (defn main [] :i64
-  (emit-sorted (slurp-file (arg "0"))))
+  (let [path (arg "0")]
+    (if (readable? path)
+      (emit-sorted (slurp-file path))
+      ;; `sort: No such file or directory`, exit 2. sort names NO path and
+      ;; exits 2 where cat, wc, head and uniq name the path and exit 1 --
+      ;; measured on each of them rather than assumed from one.
+      (do
+        (emit-error "sort: No such file or directory")
+        (emit-error (nl))
+        2))))
