@@ -74,7 +74,29 @@
    ;; A MISSING operand: matched on stderr and exit status since wire 35
    ;; gained an EXISTS form. Every utility words this differently --
    ;; measured on each, not copied from a sibling.
-   ["missing"]])
+   ["missing"]
+   ;; --- two or more operands ------------------------------------------
+   ;; sort MERGES: no headers, and the operand order does not change the
+   ;; output because everything is sorted together.
+   ["fruit" "nums"] ["nums" "fruit"]
+   ;; The same file twice: every line appears twice.
+   ["dup" "dup"]
+   ;; An empty operand contributes nothing.
+   ["fruit" "empty"] ["empty" "fruit"]
+   ;; THE case that separates reading operands as LINES from concatenating
+   ;; their bytes. `nonl` ends without a newline, so a byte concatenation
+   ;; runs its last line into the next file's first one -- measured,
+   ;; `sort nonl fruit` keeps `nonl-a` whole where `cat nonl fruit | sort`
+   ;; produces `nonl-aapple`.
+   ["nonl" "fruit"] ["fruit" "nonl"] ["nonl" "one"]
+   ;; Multi-byte across operands.
+   ["utf8" "fruit"]
+   ;; An unreadable operand writes NOTHING -- not the readable ones and not
+   ;; a partial answer -- and exits 2. An implementation that printed what
+   ;; it could, the way cat and wc do, fails these three and nothing else.
+   ["fruit" "missing"] ["missing" "fruit"] ["fruit" "missing" "nums"]
+   ;; Three readable operands.
+   ["fruit" "nums" "dup"]])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
@@ -126,7 +148,16 @@
     ;; Now the only thing that matters: run it.
     (let [results
           (for [names cases]
-            (let [argv [(.join path (.realpathSync fs (.join path tmp "data")) (first names))]
+            ;; EVERY operand is a path. This took only `(first names)` until
+            ;; 2026-09-10, which silently dropped the rest -- the twelve
+            ;; multi-operand cases added that day all passed against it,
+            ;; because both implementations were handed one file and agreed
+            ;; about it. The giveaway was in the output rather than the
+            ;; status: `["fruit" "nums"]` printed fruit's three lines with
+            ;; none of nums', and `["fruit" "missing"]` printed instead of
+            ;; failing.
+            (let [argv (mapv #(.join path (.realpathSync fs (.join path tmp "data")) %)
+                             names)
                   k (run exe argv {})
                   ;; LC_ALL=C: byte order. See the header.
                   s (run system-sort argv

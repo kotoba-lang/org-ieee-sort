@@ -145,14 +145,68 @@ b" 1 2))
 ;; answers an empty line then `a`; with the trim this answered `a` alone.
 ;; The fixture that catches it is in the suite.
 
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+;; --- several operands ----------------------------------------------------
+;;
+;; sort MERGES its operands: there are no headers and the operand order does
+;; not affect the output, since everything is sorted together. Duplicates
+;; survive -- the same file twice yields every line twice.
+;;
+;; A file whose last line has NO trailing newline still contributes that line
+;; WHOLE. Measured against /usr/bin/sort 2026-09-10, and it is the case that
+;; separates reading operands as LINES from concatenating their bytes:
+;;
+;;   sort nn.txt s2.txt      -> a c x      (`x` is its own line)
+;;   cat nn.txt s2.txt | sort -> c xa      (`x` and `a` ran together)
+;;
+;; So each operand is terminated before the next is appended.
+(defn terminated [text :string] :string
+  (let [n (string-byte-length text)]
+    (if (= n 0)
+      text
+      (if (string=? (string-substring text (- n 1) n) "\n")
+        text
+        (string-concat text (nl))))))
+
+;; Every operand's text, joined and each one terminated.
+(defn gather [i :i64 total :string acc :string] :string
+  (if (string=? (decimal-of i) total)
+    acc
+    (gather (+ i 1) total
+            (string-concat acc (terminated (slurp-file (arg (decimal-of i))))))))
+
+;; sort writes NOTHING when an operand is unreadable -- not the readable ones
+;; and not a partial answer. Measured: `sort s1 nope s2` exits 2 with empty
+;; stdout, where cat and wc print what they could. So the operands are all
+;; checked BEFORE any is read.
+(defn all-readable? [i :i64 total :string] :bool
+  (if (string=? (decimal-of i) total)
+    true
+    (if (readable? (arg (decimal-of i)))
+      (all-readable? (+ i 1) total)
+      false)))
+
 (defn main [] :i64
-  (let [path (arg "0")]
-    (if (readable? path)
-      (emit-sorted (slurp-file path))
-      ;; `sort: No such file or directory`, exit 2. sort names NO path and
-      ;; exits 2 where cat, wc, head and uniq name the path and exit 1 --
-      ;; measured on each of them rather than assumed from one.
-      (do
-        (emit-error "sort: No such file or directory")
-        (emit-error (nl))
-        2))))
+  (let [total (arg "")]
+    (if (string=? total "0")
+      ;; No operand. POSIX reads standard input; there is no stdin
+      ;; capability, so this refuses rather than pretending to have read an
+      ;; empty one.
+      2
+      (if (all-readable? 0 total)
+        (emit-sorted (gather 0 total ""))
+        ;; `sort: No such file or directory`, exit 2. sort names NO path and
+        ;; exits 2 where cat, wc, head and uniq name the path and exit 1 --
+        ;; measured on each of them rather than assumed from one.
+        (do
+          (emit-error "sort: No such file or directory")
+          (emit-error (nl))
+          2)))))

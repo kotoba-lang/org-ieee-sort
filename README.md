@@ -77,7 +77,37 @@ that match the file you mean to sort; the suite uses 8 MB and 50,000,000.
 
 `:cli/args` (38), `:fs/app-data` (35), `:io/write` (37).
 
+## Several files are MERGED, not sectioned
+
+`sort` has no headers and no per-file structure: the operands are read
+together and sorted as one, so the operand order does not change the output.
+Duplicates survive — the same file twice yields every line twice.
+
+### A last line with no newline stays whole
+
+This is the case that separates reading operands as **lines** from
+concatenating their **bytes**. Measured against `/usr/bin/sort` 2026-09-10,
+where `nn.txt` holds `x` with no trailing newline:
+
+```
+sort nn.txt s2.txt         ->  a  c  x        `x` is its own line
+cat nn.txt s2.txt | sort   ->  c  xa          `x` and `a` ran together
+```
+
+So each operand is terminated before the next is appended. The control is
+precise: dropping that termination fails exactly the two cases where the
+unterminated file is *followed* by another operand, and leaves
+`["fruit" "nonl"]` passing — nothing follows it there to run into.
+
+### An unreadable operand writes nothing at all
+
+Not the readable operands, not a partial answer: `sort s1 nope s2` exits 2
+with empty stdout, where `cat` and `wc` print what they could. So every
+operand is checked **before** any is read. Removing that check fails all four
+missing-operand cases.
+
 ## What this is not
 
-One operand, ascending, byte order. No `-r`, `-n`, `-u`, `-k`, `-f`, no
-merging several files, no reading standard input.
+Ascending, byte order. No `-r`, `-n`, `-u`, `-k`, `-f`, no reading standard
+input — with no operand this exits 2 rather than pretending to have read an
+empty one.
