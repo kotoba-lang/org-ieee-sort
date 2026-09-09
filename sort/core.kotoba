@@ -1,0 +1,134 @@
+;; sort -- POSIX sort (IEEE Std 1003.1) for ONE operand, byte order.
+;;
+;;   sort FILE     the lines, ascending
+;;
+;; ## No ordering primitive was needed, and that is worth stating
+;;
+;; The language has no string comparison but `string=`, which is why
+;; `org-ieee-ls` records `-a` as needing "a merge into byte order" it could
+;; not do. It does not need a primitive: UTF-8 preserves code point order
+;; lexicographically, so walking both strings with `string-code-point-at` and
+;; comparing code points gives exactly byte order. `less?` below is that walk.
+;;
+;; ## Byte order, so the comparison is `LC_ALL=C sort`
+;;
+;; Measured 2026-09-10 on `b a B A`: the default locale answers `a A b B` and
+;; LC_ALL=C answers `A B a b`. On `日 é z` the default answers `日 é z` and
+;; LC_ALL=C answers `z é 日`. This produces the second in both cases -- the
+;; POSIX locale -- and the test compares against it.
+;;
+;; ## sort ADDS the newline a last line lacks
+;;
+;; Measured: a 13-byte file whose last line has no newline produces 14 bytes.
+;; Same as grep, opposite of head.
+;;
+;; ## Selection sort, and why
+;;
+;; Substrings are VIEWS and cost no arena bytes; `string-concat` is what
+;; allocates, and the arena never reclaims. So the shape that matters is how
+;; many concatenations happen, not how many comparisons. Selection sort emits
+;; the minimum and rebuilds the remainder once per line -- O(n) concatenations
+;; per line -- rather than building a sorted accumulator, which would
+;; concatenate on every comparison.
+(ns sort.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+;; The UTF-8 width of the code point starting at byte offset I, from its
+;; VALUE -- the contract `string-code-point-at` states.
+(defn cp-width [c :i64] :i64
+  (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+
+;; Is A strictly less than B in byte order? Walks both by code points; UTF-8
+;; keeps code point order and byte order the same, so this IS byte order. A
+;; proper prefix is less than what extends it.
+;;
+;; The lengths are recomputed each step rather than carried. Six parameters
+;; exceeded the native ABI's supported arity -- `function parameters exceed
+;; ABI-supported arity` -- and `string-byte-length` is a host callback, so
+;; asking twice per step costs no fuel and no arena.
+(defn less-from [a :string b :string i :i64 j :i64] :bool
+  (if (>= i (string-byte-length a))
+    (if (>= j (string-byte-length b)) false true)
+    (if (>= j (string-byte-length b))
+      false
+      (let [ca (string-code-point-at a i)
+            cb (string-code-point-at b j)]
+        (if (< ca cb)
+          true
+          (if (> ca cb)
+            false
+            (less-from a b (+ i (cp-width ca)) (+ j (cp-width cb)))))))))
+
+(defn less? [a :string b :string] :bool
+  (less-from a b 0 0))
+
+;; --- the line list, carried as one "\n"-joined string ---------------------
+
+(defn first-line [s :string] :string
+  (let [i (string-index-of s "\n")]
+    (if (< i 0) s (string-substring s 0 i))))
+
+(defn rest-lines [s :string] :string
+  (let [i (string-index-of s "\n")]
+    (if (< i 0) "" (string-substring s (+ i 1) (string-byte-length s)))))
+
+(defn append-line [acc :string x :string] :string
+  (if (= (string-byte-length acc) 0)
+    x
+    (string-concat (string-concat acc (nl)) x)))
+
+;; The smallest line of S, given a candidate BEST already taken from it.
+(defn min-line [s :string best :string] :string
+  (if (= (string-byte-length s) 0)
+    best
+    (let [head (first-line s)]
+      (min-line (rest-lines s) (if (less? head best) head best)))))
+
+;; S without its FIRST line equal to TARGET. Duplicates are kept: only one
+;; occurrence is removed per pass, which is what makes `dup dup a` answer
+;; `a dup dup` and not `a dup`.
+(defn drop-one [s :string target :string acc :string done :bool] :string
+  (if (= (string-byte-length s) 0)
+    acc
+    (let [head (first-line s)
+          rest (rest-lines s)]
+      (if (if done false (string=? head target))
+        (drop-one rest target acc true)
+        (drop-one rest target (append-line acc head) done)))))
+
+(defn emit-sorted [s :string] :i64
+  (if (= (string-byte-length s) 0)
+    0
+    (let [m (min-line (rest-lines s) (first-line s))]
+      (do
+        (emit m)
+        (emit (nl))
+        (emit-sorted (drop-one s m "" false))))))
+
+;; There is no trim of the final newline, and its ABSENCE is deliberate.
+;;
+;; The first version had one, on the reasoning that a file ending in "\n"
+;; would otherwise sort an empty line to the front. It never did: the walk
+;; stops when the remainder is empty, so the piece after the last newline is
+;; never produced as a line. The control that removed the trim passed all
+;; nine cases -- which said the code was dead.
+;;
+;; It was worse than dead. A file ending in "\n\n" has a genuinely EMPTY last
+;; line, and sort prints it. Measured 2026-09-10 on `a\n\n`: /usr/bin/sort
+;; answers an empty line then `a`; with the trim this answered `a` alone.
+;; The fixture that catches it is in the suite.
+
+(defn main [] :i64
+  (emit-sorted (slurp-file (arg "0"))))
