@@ -34,13 +34,12 @@
 ;; one that passes the others:
 ;;
 ;;   one file           -- the basic contract
-;;   two files          -- concatenated in ORDER, with nothing added between
+;;   two files          -- merged and sorted together, with no headers
 ;;   the same file twice-- an operand is not deduplicated
 ;;   an EMPTY file      -- reads as the empty string, which must not end the
 ;;                         loop the way "past the last operand" does
 ;;   empty then content -- the same trap from the other side
-;;   no trailing newline-- cat adds nothing of its own
-;;   binary-ish bytes   -- high bytes survive the round trip
+;;   no trailing newline-- sort ADDS the newline, and the line stays whole
 ;;   no operands        -- POSIX reads stdin; there is no stdin capability,
 ;;                         so this asserts what it ACTUALLY does (nothing),
 ;;                         not what POSIX says
@@ -55,7 +54,7 @@
    ;; No trailing newline: sort ADDS one, 13 bytes in and 14 out.
    "nonl"   "nonl-b\nnonl-a"
    ;; Multi-byte, where a byte walk and a code-point walk must agree.
-   "utf8"   "\u65e5\n\u00e9\nz\n"
+   "utf8"   "日\né\nz\n"
    "one"    "x\n"
    "empty"  ""
    ;; A common prefix: `a` sorts before `ab`, which is the case a comparison
@@ -66,11 +65,97 @@
    ;; `a\n\n` answer `a` where sort answers an empty line and then `a`, and
    ;; every other fixture here passed with and without it.
    "blank"      "b\n\na\n"
-   "trailblank" "a\n\n"})
+   ;; With `-r` the empty line goes LAST, which is what caught the
+   ;; accumulator that could not tell "no lines yet" from "one empty line".
+   "trailblank" "a\n\n"
+   "twoblank"   "a\n\n\nb\n"
+
+   ;; --- -u ---------------------------------------------------------------
+   "udup"   "b\na\nb\na\nc\n"
+   "usame"  "x\nx\nx\n"
+   ;; Duplicate EMPTY lines: -u keeps one, and it sorts first.
+   "ublank" "a\n\n\nb\n"
+   ;; A duplicate that straddles the missing final newline.
+   "unonl"  "z\na\nz"
+
+   ;; --- -n, one measured shape per fixture -------------------------------
+   ;; Ordinary numbers, where the numeric and the lexical order disagree.
+   "nbasic" "10\n9\n100\n2\n"
+   ;; Lines that are not numbers at all: key 0, then the whole-line
+   ;; tiebreak. `apple` and `banana` come out in byte order and not in input
+   ;; order, which is also the proof that -n is not stable.
+   "nmixed" "banana\n10\napple\n9\n2\n"
+   ;; Negatives, with two non-numbers sitting between them and the
+   ;; positives.
+   "nneg"   "banana\n-5\n10\napple\n0\n"
+   "nonly"  "-5\n-10\n-1\n3\n0\n"
+   ;; A leading '+' is NOT a number here: measured `+1 +5 3 10`, not
+   ;; `+1 3 +5 10`.
+   "nplus"  "+5\n3\n+1\n10\n"
+   "nplus2" "+5\n-1\n2\n"
+   ;; Leading blanks are skipped -- space and TAB.
+   "nblank" "  5\n3\n 4\n\t2\n"
+   ;; \v and \f are NOT blanks. Measured: `\v7 \f6 5` answers `\v7 \f6 5`,
+   ;; which is byte order over three key-0 lines. Had they been skipped the
+   ;; keys would be 7, 6 and 5 and the answer would be `5 \f6 \v7`.
+   "nws"    "\u000b7\n\u000c6\n5\n"
+   ;; An empty line: key 0, and first because "" is bytewise least.
+   "nempty" "5\n\n3\n0\n"
+   "nspace" " \n\n0\n"
+   ;; The key is a leading PREFIX, not the whole line.
+   "npfx"   "10abc\n9xyz\n2zzz\n"
+   "npfx2"  "3abc9\n30\n"
+   ;; No exponent: 1e3 is 1.
+   "nexp"   "1e3\n50\n2\n"
+   ;; Equal keys, distinct lines: ordered by the WHOLE line, not by input
+   ;; position.
+   "ntie"   "1\n01\n 1\n1x\n"
+   ;; And the tiebreak is the whole line rather than the part after the
+   ;; number: `01b` before `1a`.
+   "ntie2"  "1a\n01b\n"
+   "nzeros" "007\n7\n10\n"
+   ;; Fractions.
+   "nfrac"  "1.5\n1.25\n1.10\n2\n"
+   "nfrac2" "1.50\n1.5\n1.500\n"
+   "nfrac3" "2\n2.000\n1.999\n"
+   ;; A NEGATIVE fraction that is a byte-prefix of another. This is the only
+   ;; shape where "a missing fraction digit reads as 0" can be told apart
+   ;; from "stop at the shorter fraction": on the positive side the extra
+   ;; digits only make the number bigger AND the line bytewise larger, so
+   ;; both rules agree. Negated, they disagree -- measured, `-1.50001` comes
+   ;; first, where a whole-line tiebreak would have put `-1.5` first.
+   "nfracn" "-1.5\n-1.50001\n"
+   "nfracn2" "-1.5\n-1.6\n-1.55\n"
+   "ndot"   ".5\n-.5\n0\n1\n"
+   "ndot2"  "5.\n5\n4\n"
+   "ndot3"  "1.2.3\n1.3\n1.1\n"
+   ;; A lone '-' and a lone '.' are 0.
+   "nlone"  "-\n.\n0\n-1\n1\n"
+   "nlone2" "-.\n-\n.\n0\n"
+   ;; A space after the '-' ends it: key 0.
+   "nsgnsp" "- 5\n-5\n0\n"
+   ;; -0 EQUALS 0. The pair `-0 0` cannot show it -- both orderings agree on
+   ;; it -- so the fixture is `-0` against `  0`, where a sign that made -0
+   ;; strictly negative puts `-0` first and sort puts `  0` first.
+   "nzero"  "-0\n  0\n"
+   ;; Past i64 (19 digits) and past any binary float: 21 and then 31 digits
+   ;; that differ only in the last one.
+   "nbig"   "123456789012345678901\n123456789012345678900\n5\n"
+   "nbig2"  "1111111111111111111111111111112\n1111111111111111111111111111111\n"})
+
+;; An argv entry that begins with '-' is a FLAG and is passed through; every
+;; other entry is a path into the fixture directory.
+;;
+;; Joining a flag onto the fixture path would have produced `/tmp/.../-r`,
+;; which does not exist -- and then BOTH implementations would have failed
+;; with the same missing-file message and the same exit 2, so every flag case
+;; would have PASSED while testing nothing at all. That is the same shape as
+;; the `(first names)` bug below, one argument to the left.
+(defn- flag? [s] (str/starts-with? s "-"))
 
 (def cases
   [["fruit"] ["case"] ["nums"] ["dup"] ["nonl"] ["utf8"] ["one"] ["empty"]
-   ["prefix"] ["blank"] ["trailblank"]
+   ["prefix"] ["blank"] ["trailblank"] ["twoblank"]
    ;; A MISSING operand: matched on stderr and exit status since wire 35
    ;; gained an EXISTS form. Every utility words this differently --
    ;; measured on each, not copied from a sibling.
@@ -96,7 +181,42 @@
    ;; it could, the way cat and wc do, fails these three and nothing else.
    ["fruit" "missing"] ["missing" "fruit"] ["fruit" "missing" "nums"]
    ;; Three readable operands.
-   ["fruit" "nums" "dup"]])
+   ["fruit" "nums" "dup"]
+
+   ;; --- -r ---------------------------------------------------------------
+   ;; The exact reverse of the ascending answer, duplicates kept.
+   ["-r" "fruit"] ["-r" "case"] ["-r" "nums"] ["-r" "dup"] ["-r" "prefix"]
+   ["-r" "utf8"] ["-r" "one"] ["-r" "empty"] ["-r" "nonl"] ["-r" "blank"]
+   ;; The empty line goes LAST here, which is where a joined accumulator
+   ;; loses it.
+   ["-r" "trailblank"] ["-r" "twoblank"]
+   ["-r" "fruit" "nums"] ["-r" "nonl" "fruit"]
+   ["-r" "missing"] ["-r" "fruit" "missing"]
+
+   ;; --- -u ---------------------------------------------------------------
+   ["-u" "udup"] ["-u" "usame"] ["-u" "ublank"] ["-u" "unonl"] ["-u" "dup"]
+   ["-u" "fruit"] ["-u" "empty"] ["-u" "utf8"] ["-u" "trailblank"]
+   ;; Across operands: the same file twice collapses to one copy.
+   ["-u" "dup" "dup"] ["-u" "fruit" "fruit"] ["-u" "nonl" "fruit"]
+   ["-u" "missing"] ["-u" "missing" "fruit"]
+
+   ;; --- -n ---------------------------------------------------------------
+   ["-n" "nbasic"] ["-n" "nums"] ["-n" "nmixed"] ["-n" "nneg"] ["-n" "nonly"]
+   ["-n" "nplus"] ["-n" "nplus2"] ["-n" "nblank"] ["-n" "nws"]
+   ["-n" "nempty"] ["-n" "nspace"]
+   ["-n" "npfx"] ["-n" "npfx2"] ["-n" "nexp"]
+   ["-n" "ntie"] ["-n" "ntie2"] ["-n" "nzeros"]
+   ["-n" "nfrac"] ["-n" "nfrac2"] ["-n" "nfrac3"]
+   ["-n" "nfracn"] ["-n" "nfracn2"]
+   ["-n" "ndot"] ["-n" "ndot2"] ["-n" "ndot3"]
+   ["-n" "nlone"] ["-n" "nlone2"] ["-n" "nsgnsp"] ["-n" "nzero"]
+   ["-n" "nbig"] ["-n" "nbig2"]
+   ;; -n over things that are not numbers at all, and over empties.
+   ["-n" "fruit"] ["-n" "utf8"] ["-n" "empty"] ["-n" "blank"]
+   ["-n" "trailblank"] ["-n" "dup"]
+   ;; -n across operands, including the unterminated one.
+   ["-n" "nbasic" "nums"] ["-n" "nonl" "nbasic"] ["-n" "nmixed" "fruit"]
+   ["-n" "missing"] ["-n" "nbasic" "missing"]])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
@@ -109,8 +229,7 @@
         policy (.join path tmp "policy.edn")
         kexe (.join path tmp "sort.kexe")
         blob (.join path tmp "sort.bin")
-        exe (.join path tmp "sort")
-        exe-big (.join path tmp "sort-big")]
+        exe (.join path tmp "sort")]
     (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39]}}" "utf8")
     ;; The fixtures live in the tree the binary is packaged for. The native
     ;; loader refuses a relative request outright, so operands are absolute.
@@ -129,15 +248,10 @@
           report (str (:out e))
           offset (second (re-find #":offset (\d+)" report))]
       (when-not offset (refuse (str "no :offset in the extract report: " report)))
-      ;; TWO binaries from the same code: one with the loader's default
-      ;; string-arena budget and one with a raised budget. The pair is what
-      ;; makes the ceiling below a measurement instead of a claim -- a single
-      ;; binary could only show that some size works and some does not, not
-      ;; that the bound is the arena and that it moves.
       ;; Fuel and arena are constants of the binary, so they are packaged
-      ;; here rather than supplied at run time. Counting words walks one code
-      ;; point at a time, so the guest recursion is as long as the file and
-      ;; the default 512 fuel counts almost nothing.
+      ;; here rather than supplied at run time. Sorting walks one code point
+      ;; at a time and the numeric key walks the digits again, so the guest
+      ;; recursion is long and the default 512 fuel counts almost nothing.
       (doseq [[out extra] [[exe ["--fuel" "50000000" "--string-pool" "8000000"]]]]
         (let [p (run "nbb" (into [packager "--code" blob "--offset" offset "--isa" "aarch64"
                                   "--allow" "35,37,38,39"
@@ -146,18 +260,18 @@
                                  extra) {})]
           (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p))))))))
     ;; Now the only thing that matters: run it.
-    (let [results
+    (let [data (.realpathSync fs (.join path tmp "data"))
+          results
           (for [names cases]
-            ;; EVERY operand is a path. This took only `(first names)` until
-            ;; 2026-09-10, which silently dropped the rest -- the twelve
-            ;; multi-operand cases added that day all passed against it,
-            ;; because both implementations were handed one file and agreed
-            ;; about it. The giveaway was in the output rather than the
-            ;; status: `["fruit" "nums"]` printed fruit's three lines with
-            ;; none of nums', and `["fruit" "missing"]` printed instead of
-            ;; failing.
-            (let [argv (mapv #(.join path (.realpathSync fs (.join path tmp "data")) %)
-                             names)
+            ;; EVERY operand is a path, and every FLAG is not. This took only
+            ;; `(first names)` until 2026-09-10, which silently dropped the
+            ;; rest -- the twelve multi-operand cases added that day all
+            ;; passed against it, because both implementations were handed
+            ;; one file and agreed about it. The giveaway was in the output
+            ;; rather than the status: `["fruit" "nums"]` printed fruit's
+            ;; three lines with none of nums', and `["fruit" "missing"]`
+            ;; printed instead of failing.
+            (let [argv (mapv #(if (flag? %) % (.join path data %)) names)
                   k (run exe argv {})
                   ;; LC_ALL=C: byte order. See the header.
                   s (run system-sort argv
@@ -179,6 +293,6 @@
                       (pr-str (:argv r))
                       " -> " (pr-str (:kotoba r))
                       (when-not (:ok r) (str " but " system-sort " says " (pr-str (:system r))
-                                             " exits " (pr-str (:exit r))))))) 
+                                             " exits " (pr-str (:exit r)))))))
       (println (pr-str {:ok (empty? bad) :cases (count results) :failed (count bad)}))
       (.exit js/process (if (seq bad) 1 0)))))

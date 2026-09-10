@@ -1,6 +1,15 @@
-;; sort -- POSIX sort (IEEE Std 1003.1) for ONE operand, byte order.
+;; sort -- POSIX sort (IEEE Std 1003.1), byte order, with -r, -u and -n.
 ;;
-;;   sort FILE     the lines, ascending
+;;   sort FILE...        the lines of every operand, merged, ascending
+;;   sort -r FILE...     descending
+;;   sort -u FILE...     ascending, adjacent duplicates dropped AFTER sorting
+;;   sort -n FILE...     by a leading numeric key
+;;
+;; ONE flag, and it is argument 0. Combining them is out of scope -- see the
+;; README. The flag is recognised by argument 0's SHAPE and never by the
+;; argument COUNT: `org-ieee-cut` asked about the count until 2026-09-10 and
+;; was right for exactly one operand, so this asks the question that stays
+;; right when a second operand appears.
 ;;
 ;; ## No ordering primitive was needed, and that is worth stating
 ;;
@@ -29,7 +38,8 @@
 ;; many concatenations happen, not how many comparisons. Selection sort emits
 ;; the minimum and rebuilds the remainder once per line -- O(n) concatenations
 ;; per line -- rather than building a sorted accumulator, which would
-;; concatenate on every comparison.
+;; concatenate on every comparison. The numeric key below is therefore built
+;; entirely out of substrings and never out of `string-concat`.
 (ns sort.core (:export [main]))
 
 (defn arg [i :string] :string
@@ -89,7 +99,171 @@ b" 1 2))
 (defn less? [a :string b :string] :bool
   (less-from a b 0 0))
 
-;; --- the line list, carried as one "\n"-joined string ---------------------
+;; --- the numeric key, for -n ---------------------------------------------
+;;
+;; Measured against `LC_ALL=C /usr/bin/sort -n` on 2026-09-10, one shape at a
+;; time, because every one of these was a guess that turned out to have an
+;; answer. The model that fits ALL of them:
+;;
+;;   key(line) = the leading numeric prefix, after [ \t]* and an optional '-'
+;;   ties on the key are broken by comparing the WHOLE LINE in byte order
+;;
+;; and the second half is not a detail. `1 01 " 1" 1x` all have key 1 and come
+;; out ` 1`, `01`, `1`, `1x` -- which is byte order and is NOT the input
+;; order, so `sort -n` is not stable with respect to equal keys. That is what
+;; lets a selection sort reproduce it: the order is total, so there is no
+;; input position to preserve.
+;;
+;; What the measurement contradicted:
+;;
+;;   `+5`     is NOT a number. `+5 3 +1 10` answers `+1 +5 3 10` -- key 0 for
+;;            both plus-signed lines, then the byte tiebreak. A '+' reader
+;;            would have answered `+1 3 +5 10`.
+;;   `\v` `\f` are NOT blanks. Only space and tab are skipped.
+;;   `-0`     EQUALS 0. `-0` against `  0` answers `  0` first, which is the
+;;            byte tiebreak; a sign that made -0 strictly negative would have
+;;            answered `-0` first. Both orderings agree on `-0` vs `0`, which
+;;            is why that pair alone could not decide it.
+;;   `1e3`    is 1, not 1000: the prefix stops at the first non-digit.
+;;   the tiebreak is the WHOLE line, not the part after the number: `1a` and
+;;            `01b` answer `01b 1a`, which is the whole line, where comparing
+;;            the remainders would have answered `1a 01b`.
+;;   the value is not a float and not an i64. Thirty ones against twenty-nine
+;;            ones and a two are ordered correctly, and no binary float and no
+;;            64-bit integer can tell those apart. So this compares DECIMAL
+;;            DIGITS, which is also why it needs no `text->i64` and cannot
+;;            overflow.
+
+(defn digit-at [s :string i :i64] :i64
+  (if (>= i (string-byte-length s))
+    -1
+    (let [c (string-code-point-at s i)]
+      (if (< c 48) -1 (if (> c 57) -1 (- c 48))))))
+
+;; Space and tab, and nothing else. Measured: `\v7 \f6 5` answers `\v7 \f6 5`,
+;; which is byte order over three key-0 lines -- so `\v` and `\f` did not get
+;; skipped and `7` and `6` were never read.
+(defn blank-at? [s :string i :i64] :bool
+  (if (>= i (string-byte-length s))
+    false
+    (let [c (string-code-point-at s i)]
+      (if (= c 32) true (= c 9)))))
+
+(defn char-is? [s :string i :i64 c :i64] :bool
+  (if (>= i (string-byte-length s))
+    false
+    (= (string-code-point-at s i) c)))
+
+(defn skip-blanks [s :string i :i64] :i64
+  (if (blank-at? s i) (skip-blanks s (+ i 1)) i))
+
+(defn scan-digits [s :string i :i64] :i64
+  (if (>= (digit-at s i) 0) (scan-digits s (+ i 1)) i))
+
+;; Where the number may start: past the blanks, past one '-'. There is no '+'
+;; branch, and its absence is measured rather than forgotten.
+(defn sign-at [s :string] :i64
+  (skip-blanks s 0))
+
+(defn negative-sign? [s :string] :bool
+  (char-is? s (sign-at s) 45))
+
+(defn digits-start [s :string] :i64
+  (if (negative-sign? s) (+ (sign-at s) 1) (sign-at s)))
+
+(defn int-end [s :string] :i64
+  (scan-digits s (digits-start s)))
+
+;; A '.' right after the integer digits opens the fraction; otherwise the
+;; fraction is the empty span at `int-end`, since `scan-digits` stopped there
+;; on a byte that is not a digit.
+(defn frac-start [s :string] :i64
+  (if (char-is? s (int-end s) 46) (+ (int-end s) 1) (int-end s)))
+
+(defn frac-end [s :string] :i64
+  (scan-digits s (frac-start s)))
+
+;; Both are SUBSTRINGS -- views, no arena. Every offset came from a scan over
+;; ASCII bytes, so every one of them is a code point boundary.
+(defn int-part [s :string] :string
+  (string-substring s (digits-start s) (int-end s)))
+
+(defn frac-part [s :string] :string
+  (string-substring s (frac-start s) (frac-end s)))
+
+(defn skip-zeros [d :string i :i64] :i64
+  (if (char-is? d i 48) (skip-zeros d (+ i 1)) i))
+
+(defn all-zeros? [d :string i :i64] :bool
+  (if (>= i (string-byte-length d))
+    true
+    (if (char-is? d i 48) (all-zeros? d (+ i 1)) false)))
+
+;; Two digit spans of the SAME length, left to right. -1, 0 or 1.
+(defn cmp-same-length [a :string b :string i :i64 n :i64] :i64
+  (if (>= i n)
+    0
+    (let [ca (string-code-point-at a i)
+          cb (string-code-point-at b i)]
+      (if (< ca cb) -1 (if (> ca cb) 1 (cmp-same-length a b (+ i 1) n))))))
+
+;; Integer magnitudes as decimal digits: leading zeros dropped, then more
+;; digits is more, then left to right. `007` and `7` compare equal, which is
+;; what makes them fall to the whole-line tiebreak, which is what puts `007`
+;; first.
+(defn cmp-int [a :string b :string] :i64
+  (let [sa (string-substring a (skip-zeros a 0) (string-byte-length a))
+        sb (string-substring b (skip-zeros b 0) (string-byte-length b))
+        la (string-byte-length sa)
+        lb (string-byte-length sb)]
+    (if (< la lb) -1 (if (> la lb) 1 (cmp-same-length sa sb 0 la)))))
+
+;; Fractions, digit by digit, a missing digit reading as 0 -- so `1.5` and
+;; `1.50` are equal and `1.10` is below `1.5`.
+(defn cmp-frac-digit [d :i64] :i64
+  (if (< d 0) 0 d))
+
+(defn cmp-frac-at [a :string b :string i :i64] :i64
+  (if (< (cmp-frac-digit (digit-at a i)) (cmp-frac-digit (digit-at b i)))
+    -1
+    (if (> (cmp-frac-digit (digit-at a i)) (cmp-frac-digit (digit-at b i)))
+      1
+      0)))
+
+;; Runs until BOTH spans are exhausted, so the shorter one keeps reading 0.
+(defn cmp-fraction [a :string b :string i :i64] :i64
+  (if (if (>= i (string-byte-length a)) (>= i (string-byte-length b)) false)
+    0
+    (let [c (cmp-frac-at a b i)] (if (= c 0) (cmp-fraction a b (+ i 1)) c))))
+
+(defn cmp-magnitude [a :string b :string] :i64
+  (let [c (cmp-int (int-part a) (int-part b))]
+    (if (= c 0) (cmp-fraction (frac-part a) (frac-part b) 0) c)))
+
+;; `-0` is not negative. Measured: `-0` against `  0` answers `  0` first,
+;; which is the whole-line tiebreak between two EQUAL keys.
+(defn zero-magnitude? [s :string] :bool
+  (if (all-zeros? (int-part s) 0) (all-zeros? (frac-part s) 0) false))
+
+(defn negative? [s :string] :bool
+  (if (negative-sign? s) (if (zero-magnitude? s) false true) false))
+
+(defn cmp-numeric [a :string b :string] :i64
+  (let [na (negative? a)
+        nb (negative? b)]
+    (if (if na (if nb false true) false)
+      -1
+      (if (if nb (if na false true) false)
+        1
+        (let [c (cmp-magnitude a b)]
+          (if na (- 0 c) c))))))
+
+;; The key, then the whole line. Both halves are measured; see above.
+(defn numeric-less? [a :string b :string] :bool
+  (let [c (cmp-numeric a b)]
+    (if (< c 0) true (if (> c 0) false (less? a b)))))
+
+;; --- the line list, carried as one "\n"-TERMINATED string -----------------
 
 (defn first-line [s :string] :string
   (let [i (string-index-of s "\n")]
@@ -99,38 +273,59 @@ b" 1 2))
   (let [i (string-index-of s "\n")]
     (if (< i 0) "" (string-substring s (+ i 1) (string-byte-length s)))))
 
+;; Every line is TERMINATED, not JOINED, and that distinction is the whole
+;; reason this function changed for -r.
+;;
+;; It used to join: `(if (= (string-byte-length acc) 0) x ...)`, treating an
+;; empty accumulator as "nothing appended yet". An accumulator holding one
+;; EMPTY LINE is also the empty string, so the two are the same value and the
+;; line is lost. Ascending never showed it -- an empty line is the smallest
+;; line there is, so it is emitted first and never sits alone in the
+;; remainder. `sort -r` puts it LAST, and `-r` on `a\n\n` answered `a` where
+;; /usr/bin/sort answers `a` and then an empty line.
+;;
+;; Terminating instead of joining makes "no lines" and "one empty line" the
+;; distinct values "" and "\n". It costs the same two concatenations.
 (defn append-line [acc :string x :string] :string
-  (if (= (string-byte-length acc) 0)
-    x
-    (string-concat (string-concat acc (nl)) x)))
+  (string-concat acc (string-concat x (nl))))
+
+;; --- the order ------------------------------------------------------------
+;;
+;; mode 0 = ascending byte order   mode 2 = -n
+;;      1 = -r                          3 = -u (ascending; -u is a filter)
+(defn before? [a :string b :string mode :i64] :bool
+  (if (= mode 2)
+    (numeric-less? a b)
+    (if (= mode 1) (less? b a) (less? a b))))
 
 ;; The smallest line of S, given a candidate BEST already taken from it.
-(defn min-line [s :string best :string] :string
+(defn min-line [s :string best :string mode :i64] :string
   (if (= (string-byte-length s) 0)
     best
     (let [head (first-line s)]
-      (min-line (rest-lines s) (if (less? head best) head best)))))
+      (min-line (rest-lines s) (if (before? head best mode) head best) mode))))
 
-;; S without its FIRST line equal to TARGET. Duplicates are kept: only one
-;; occurrence is removed per pass, which is what makes `dup dup a` answer
-;; `a dup dup` and not `a dup`.
-(defn drop-one [s :string target :string acc :string done :bool] :string
+;; S without its FIRST line equal to TARGET, or without EVERY such line when
+;; ALL. One occurrence is what makes `dup dup a` answer `a dup dup`; every
+;; occurrence is -u, which drops the duplicates AFTER the sort rather than
+;; before it -- the same thing here, since the order is total either way.
+(defn drop-one [s :string target :string acc :string done :bool all :bool] :string
   (if (= (string-byte-length s) 0)
     acc
     (let [head (first-line s)
           rest (rest-lines s)]
-      (if (if done false (string=? head target))
-        (drop-one rest target acc true)
-        (drop-one rest target (append-line acc head) done)))))
+      (if (if done (if all (string=? head target) false) (string=? head target))
+        (drop-one rest target acc true all)
+        (drop-one rest target (append-line acc head) done all)))))
 
-(defn emit-sorted [s :string] :i64
+(defn emit-sorted [s :string mode :i64] :i64
   (if (= (string-byte-length s) 0)
     0
-    (let [m (min-line (rest-lines s) (first-line s))]
+    (let [m (min-line (rest-lines s) (first-line s) mode)]
       (do
         (emit m)
         (emit (nl))
-        (emit-sorted (drop-one s m "" false))))))
+        (emit-sorted (drop-one s m "" false (= mode 3)) mode)))))
 
 ;; There is no trim of the final newline, and its ABSENCE is deliberate.
 ;;
@@ -176,7 +371,8 @@ b" 1 2))
         text
         (string-concat text (nl))))))
 
-;; Every operand's text, joined and each one terminated.
+;; Every operand's text, joined and each one terminated. I is where the
+;; operands begin: 1 when argument 0 was a flag, 0 when it was not.
 (defn gather [i :i64 total :string acc :string] :string
   (if (string=? (decimal-of i) total)
     acc
@@ -186,13 +382,40 @@ b" 1 2))
 ;; sort writes NOTHING when an operand is unreadable -- not the readable ones
 ;; and not a partial answer. Measured: `sort s1 nope s2` exits 2 with empty
 ;; stdout, where cat and wc print what they could. So the operands are all
-;; checked BEFORE any is read.
+;; checked BEFORE any is read. Measured again with each flag: `sort -r nope`,
+;; `sort -u nope` and `sort -n nope` all answer exactly the same way.
 (defn all-readable? [i :i64 total :string] :bool
   (if (string=? (decimal-of i) total)
     true
     (if (readable? (arg (decimal-of i)))
       (all-readable? (+ i 1) total)
       false)))
+
+;; --- the flag -------------------------------------------------------------
+;;
+;; Argument 0's SHAPE decides, never the argument COUNT. `org-ieee-cut` asked
+;; `(= 3 count)` until 2026-09-10, which was right for exactly one operand and
+;; silently wrong for two. A leading '-' is a question that keeps its answer
+;; when a second operand shows up. Operand paths are absolute here, so they
+;; begin with '/' and cannot collide with it.
+(defn flagged? [] :bool
+  (= (string-index-of (arg "0") "-") 0))
+
+;; -1 means "argument 0 began with '-' and is not one of the three". The
+;; system utility answers that with `sort: invalid option -- x` followed by
+;; its whole Usage block, which is a BSD-version-specific string this does not
+;; try to reproduce; see the README.
+(defn mode-of [] :i64
+  (if (flagged?)
+    (if (string=? (arg "0") "-r")
+      1
+      (if (string=? (arg "0") "-n")
+        2
+        (if (string=? (arg "0") "-u") 3 -1)))
+    0))
+
+(defn first-operand [] :i64
+  (if (flagged?) 1 0))
 
 (defn main [] :i64
   (let [total (arg "")]
@@ -201,12 +424,24 @@ b" 1 2))
       ;; capability, so this refuses rather than pretending to have read an
       ;; empty one.
       2
-      (if (all-readable? 0 total)
-        (emit-sorted (gather 0 total ""))
-        ;; `sort: No such file or directory`, exit 2. sort names NO path and
-        ;; exits 2 where cat, wc, head and uniq name the path and exit 1 --
-        ;; measured on each of them rather than assumed from one.
-        (do
-          (emit-error "sort: No such file or directory")
-          (emit-error (nl))
-          2)))))
+      (let [mode (mode-of)
+            start (first-operand)]
+        (if (< mode 0)
+          (do
+            (emit-error "sort: invalid option")
+            (emit-error (nl))
+            2)
+          (if (string=? (decimal-of start) total)
+            ;; A flag and no operand: stdin again, and refused for the same
+            ;; reason.
+            2
+            (if (all-readable? start total)
+              (emit-sorted (gather start total "") mode)
+              ;; `sort: No such file or directory`, exit 2. sort names NO path
+              ;; and exits 2 where cat, wc, head and uniq name the path and
+              ;; exit 1 -- measured on each of them rather than assumed from
+              ;; one.
+              (do
+                (emit-error "sort: No such file or directory")
+                (emit-error (nl))
+                2))))))))

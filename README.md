@@ -1,11 +1,17 @@
 # kotoba-lang/org-ieee-sort — POSIX `sort`, as a Kotoba command binary
 
-`sort` from IEEE Std 1003.1 for one operand, in byte order, written in
-`.kotoba` and compiled to a standalone native executable.
+`sort` from IEEE Std 1003.1, in byte order, written in `.kotoba` and compiled
+to a standalone native executable.
 
 ```sh
-./sort FILE
+./sort FILE...
+./sort -r FILE...     # descending
+./sort -u FILE...     # adjacent duplicates dropped after sorting
+./sort -n FILE...     # by a leading numeric key
 ```
+
+**One flag, and it is argument 0.** Combining them (`-rn`, `-r -u`, `-nu`) is
+out of scope and is not implemented — see *What this is not*.
 
 ## No ordering primitive was needed
 
@@ -37,30 +43,157 @@ comparing two orderings.
 `sort` also **adds** the newline a last line lacks — 13 bytes in, 14 out.
 Same as `grep`, opposite of `head`.
 
+## The flag is argument 0's SHAPE, never the argument COUNT
+
+`org-ieee-cut` asked `(= 3 count)` until 2026-09-10. That is right for
+exactly one operand and silently wrong for two: `cut -f1 a b` counts 3 and
+reads as carrying a `-d`. The bug is invisible until a second operand exists.
+
+So this asks whether argument 0 begins with `-`, which keeps its answer when
+a second operand shows up. Operand paths are absolute here, so they begin
+with `/` and cannot collide.
+
+The control is `flag-by-count`: replacing the shape test with
+`(string=? (arg "") "2")` fails **19** cases, and it fails them in *both*
+directions — the eleven two-operand cases with no flag now refuse as if they
+carried one, and the eight three-argument flag cases now try to open `-r` as
+a file. That is the sibling's bug, reproduced.
+
+## `-n`, measured one shape at a time
+
+Every one of these was a guess with an answer. The model that fits **all** of
+them, and the only thing this implements:
+
+> `key(line)` is the leading numeric prefix, after `[ \t]*` and an optional
+> `-`. Ties on the key are broken by comparing the **whole line** in byte
+> order.
+
+Six things the measurement contradicted:
+
+| assumption | measured `LC_ALL=C /usr/bin/sort -n` | so |
+|---|---|---|
+| `-n` is stable for equal keys | `1 01 " 1" 1x` → ` 1`, `01`, `1`, `1x` | it is **not** input order, it is byte order — which is why a selection sort can reproduce it at all |
+| a leading `+` is a sign | `+5 3 +1 10` → `+1 +5 3 10` | `+` is **not** accepted; both plus lines are key 0 |
+| blanks are whitespace | `\v7 \f6 5` → `\v7 \f6 5` | only **space and tab** are skipped; `\v` and `\f` leave the line non-numeric |
+| the tiebreak is the part after the number | `1a 01b` → `01b 1a` | it is the **whole line** |
+| `-0` is negative | `-0` vs `  0` → `  0` first | `-0` **equals** 0; the sign loses and the byte tiebreak decides |
+| the key is a number | 30 ones vs 29 ones and a `2`, ordered right | it is **decimal digits**. No `i64` and no float can tell those apart |
+
+And the rest, all reproduced:
+
+- **not a number at all** → key 0, then the whole-line tiebreak.
+  `banana 10 apple 9 2` → `apple banana 2 9 10`.
+- **an empty line** → key 0, and first, because `""` is bytewise least.
+  A blank-only line (`" "`) is also key 0 and sits after `""`.
+- **leading whitespace** → space and tab skipped, then the number.
+- **a leading `-`** → negative, but only if digits follow immediately:
+  `- 5` is key 0, and a lone `-` is 0.
+- **a leading numeric PREFIX**, not the whole line: `10abc 9xyz 2zzz` sorts
+  `2zzz 9xyz 10abc`, `3abc9` is 3, and `1e3` is **1** — there is no exponent.
+- **fractions**: `1.10 < 1.25 < 1.5`. `.5` is 0.5, `5.` is 5, `1.2.3` is 1.2,
+  and `1.5 = 1.50 = 1.500` so the byte tiebreak orders them.
+- **leading zeros** do not change the value: `007` and `7` tie, and `007`
+  wins the tiebreak.
+
+### What `-n` does NOT implement, and refuses rather than approximates
+
+- **No exponent** (`1e3` is 1). This is not an exclusion — it is what the
+  system utility does, measured.
+- **No `+` sign, no `\v`/`\f` blanks.** Same: measured, not omitted.
+- **No thousands separator and no locale decimal comma.** The suite runs
+  `LC_ALL=C`, where neither exists. Under another locale this would be wrong
+  and the README would be lying, which is why the locale is pinned.
+- **No `-b`, `-k`, `-t`, `-g`, `-h`, `-V`.** The key is always the whole
+  line's leading number.
+
+The comparison is exact decimal, so it does not overflow and there is no
+`text->i64` in this program: integer parts compare by significant-digit
+count and then left to right, fractions compare digit by digit with a
+missing digit reading as `0`.
+
+That last rule looks untestable and is not. On the positive side, extra
+fraction digits make a number both larger *and* bytewise later, so
+"missing reads as 0" and "stop at the shorter fraction" agree on every
+positive input. **Negated they disagree**: measured, `-1.5` and `-1.50001`
+answer `-1.50001` first, where the byte tiebreak would have answered `-1.5`
+first. The `nfracn` fixture is that shape, and it is the only reason the
+rule is checked rather than assumed.
+
 ## Measured against the system utility
 
-Eleven cases, all byte-identical. Duplicates are kept (both of them),
-`10 100 9` is lexical and not numeric, and a common prefix sorts before what
-extends it.
+**98 cases**, all byte-identical on stdout, stderr and exit status.
 
-Verified to fail as well as pass: making a prefix *not* less than its
-extension fails exactly one case, and dropping all duplicates instead of one
-per pass fails exactly one.
+### Every control, and exactly what it broke
 
-## The control that passed, and what it found
+Each is a deliberate single-line break, re-run, then restored.
 
-A third control removed a `trim-final-newline` the first version carried —
-and **all nine cases still passed**, which said the code was dead. The walk
-stops when the remainder is empty, so the piece after the last newline is
-never produced as a line; the trim had nothing to do.
+| control | what it does | fails |
+|---|---|---|
+| `HARNESS-flag-as-path` | joins the flag onto the fixture directory in the *test* | **0 — see below** |
+| `flag-by-count` | asks the argument count instead of argument 0's shape | 19: every two-operand case with no flag, and every three-argument case with one |
+| `r-noop` | `-r` compares ascending | 12: every `-r` case whose answer is order-dependent |
+| `u-nodedupe` | `-u` keeps duplicates | 7: exactly the `-u` cases that have a duplicate |
+| `append-join` | restores the joined accumulator | 3: `-r` on `blank`, `trailblank`, `twoblank` |
+| `n-lexical` | `-n` compares bytes | 20, all `-n` |
+| `n-no-tiebreak` | `-n` gives up on an equal key | 17, all `-n`: every fixture with a tie |
+| `n-minus-zero-negative` | `-0` sorts as negative | **1**: `nzero` |
+| `n-vf-are-blanks` | `\v` and `\f` skipped as blanks | **1**: `nws` |
+| `n-accept-plus` | a leading `+` reads as a sign | **2**: `nplus`, `nplus2` |
+| `n-i64-parse` | integer parts through a `text->i64` digit walk | **1**: `nbig` (21 digits, and the walk overflows) |
+| `n-frac-shortstop` | fractions stop at the shorter span | 3: `nfracn`, `nfracn2`, `ndot` |
 
-It was worse than dead. A file ending in `\n\n` has a genuinely **empty last
-line**, and `sort` prints it. On `a\n\n`, `/usr/bin/sort` answers an empty
-line then `a`; with the trim this answered `a` alone.
+The `-r` cases that survive `r-noop` are `one`, `empty`, `missing` and
+`fruit missing` — one line, no lines, and two error paths. The `-u` cases
+that survive `u-nodedupe` are the ones with nothing duplicated. Neither
+survival is a gap; there is no order to get wrong.
 
-The fixture that catches it is now in the suite, and putting the trim back
-fails exactly that one case. A control that discriminates nothing is not a
-passing control — it is a question the fixtures could not answer.
+### The control that passed, and what it found
+
+`HARNESS-flag-as-path` is a control on the **test**, not on the program, and
+it is the one that mattered. Path-joining `-r` onto the fixture directory
+produces `/tmp/.../-r`, which does not exist — so *both* implementations fail
+with the same `sort: No such file or directory` and the same exit 2, and the
+suite reports **`{:ok true, :cases 98, :failed 0}`** with all 72 flag cases
+green and none of them executing a flag.
+
+That is one argument to the left of the bug this repo already carried: the
+harness built argv as `[(first names)]` until 2026-09-10 and dropped every
+operand past the first, so twelve multi-operand cases passed while printing
+one file's lines. Same shape, same silence. The fix is that a name beginning
+with `-` is passed through verbatim, and the evidence that it is load-bearing
+is that removing it turns 72 real cases into 72 vacuous ones.
+
+### One fixture that discriminates nothing, said plainly
+
+`nbig2` is 31 ones against 30 ones and a `2`. **It survived all twelve
+controls** — zero failures, against `nbig`'s two. A `text->i64` overflows there in a way that happens to preserve
+the order, and a binary float collapses both to the same value and then falls
+to the byte tiebreak, which also preserves the order. No wrong implementation
+that could be built here fails it.
+
+It is kept as a *witness* — it pins the 31-digit answer if someone later
+swaps the digit compare for arithmetic — but it is not evidence, and calling
+it evidence would be the thing this repo keeps warning about. **`nbig` is the
+fixture that carries the discrimination**: 21 digits, and `n-i64-parse` fails
+exactly it.
+
+## The bug `-r` found in code that was already green
+
+`append-line` used to **join**: an empty accumulator meant "nothing appended
+yet", so it emitted the line alone rather than a separator and the line.
+
+An accumulator holding **one empty line** is also the empty string. The two
+were the same value, and the line was lost.
+
+Ascending never showed it. An empty line is the smallest line there is, so it
+is emitted first and never sits alone in the remainder — all 25 cases passed.
+`-r` puts it **last**: on `a\n\n` this answered `a` where `/usr/bin/sort`
+answers `a` and then an empty line.
+
+It now **terminates** rather than joins, so "no lines" and "one empty line"
+are the distinct values `""` and `"\n"`. It costs the same two
+concatenations. `append-join` restores the old form and fails exactly the
+three `-r` cases with an empty line.
 
 ## Selection sort, and why
 
@@ -70,18 +203,23 @@ many concatenations happen, not how many comparisons. Selection sort emits
 the minimum and rebuilds the remainder once per line, rather than building a
 sorted accumulator that would concatenate on every comparison.
 
+The numeric key is built the same way: it is a pair of substring **views**
+over the line, and it performs no concatenation at all.
+
 It is still O(n²) in allocations. Package with `--string-pool` and `--fuel`
 that match the file you mean to sort; the suite uses 8 MB and 50,000,000.
 
 ## Capabilities
 
-`:cli/args` (38), `:fs/app-data` (35), `:io/write` (37).
+`:cli/args` (38), `:fs/app-data` (35), `:io/write` (37), `:io/write-error`
+(39).
 
 ## Several files are MERGED, not sectioned
 
 `sort` has no headers and no per-file structure: the operands are read
 together and sorted as one, so the operand order does not change the output.
-Duplicates survive — the same file twice yields every line twice.
+Duplicates survive — the same file twice yields every line twice, and under
+`-u` it yields one copy.
 
 ### A last line with no newline stays whole
 
@@ -106,8 +244,25 @@ with empty stdout, where `cat` and `wc` print what they could. So every
 operand is checked **before** any is read. Removing that check fails all four
 missing-operand cases.
 
+Measured again with each flag: `sort -r nope`, `sort -u nope` and
+`sort -n nope` all answer identically — exit 2, empty stdout, and
+`sort: No such file or directory` — so the flag does not change this path.
+
 ## What this is not
 
-Ascending, byte order. No `-r`, `-n`, `-u`, `-k`, `-f`, no reading standard
-input — with no operand this exits 2 rather than pretending to have read an
-empty one.
+- **No combined flags.** `-rn`, `-nu`, `-r -u` and `-un` are out of scope.
+  Argument 0 is one of `-r`, `-u`, `-n` or it is an operand.
+- **No `-k`, `-t`, `-f`, `-b`, `-c`, `-m`, `-o`, `-s`, `-g`, `-h`, `-V`.**
+- **No reading standard input.** With no operand — and with a flag and no
+  operand — this exits 2 rather than pretending to have read an empty one.
+  There is no stdin capability. This is also why there is no test case for
+  it: `spawnSync` closes the child's stdin, so `/usr/bin/sort` would see EOF
+  and succeed, and the two would be answering different questions.
+- **`-` is not standard input** either; it is rejected as an unknown flag.
+- **An unknown flag is not reproduced byte for byte.** `/usr/bin/sort -x`
+  exits 2 with `sort: invalid option -- x` followed by the whole BSD `Usage:`
+  block, and `--bogus` words it differently again. That block is a
+  BSD-`sort`-version-specific string; copying it would pin this suite to one
+  build of one utility. This exits 2 and writes `sort: invalid option`, which
+  is **not** byte-identical, and there is therefore **no test case for it** —
+  named here rather than left for someone to discover.
