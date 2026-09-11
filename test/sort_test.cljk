@@ -1,4 +1,4 @@
-;; test/sort_test.cljs — build the command and compare it with the system
+;; test/sort_test.cljk — build the command and compare it with the system
 ;; sort, byte for byte, in the POSIX locale.
 ;;
 ;; LC_ALL=C, and that is not a convenience. Measured 2026-09-10 on the lines
