@@ -72,7 +72,7 @@ Six things the measurement contradicted:
 
 | assumption | measured `LC_ALL=C /usr/bin/sort -n` | so |
 |---|---|---|
-| `-n` is stable for equal keys | `1 01 " 1" 1x` → ` 1`, `01`, `1`, `1x` | it is **not** input order, it is byte order — which is why a selection sort can reproduce it at all |
+| `-n` is stable for equal keys | `1 01 " 1" 1x` → ` 1`, `01`, `1`, `1x` | it is **not** input order, it is byte order — the tie-break the merge applies |
 | a leading `+` is a sign | `+5 3 +1 10` → `+1 +5 3 10` | `+` is **not** accepted; both plus lines are key 0 |
 | blanks are whitespace | `\v7 \f6 5` → `\v7 \f6 5` | only **space and tab** are skipped; `\v` and `\f` leave the line non-numeric |
 | the tiebreak is the part after the number | `1a 01b` → `01b 1a` | it is the **whole line** |
@@ -195,19 +195,40 @@ are the distinct values `""` and `"\n"`. It costs the same two
 concatenations. `append-join` restores the old form and fails exactly the
 three `-r` cases with an empty line.
 
-## Selection sort, and why
+## Merge sort on the loader's tail append (2026-09-15)
 
 Substrings are **views** and cost no arena bytes; `string-concat` is what
-allocates, and the arena never reclaims. So the shape that matters is how
-many concatenations happen, not how many comparisons. Selection sort emits
-the minimum and rebuilds the remainder once per line, rather than building a
-sorted accumulator that would concatenate on every comparison.
+allocates, and the arena never reclaims. The first shape was a selection
+sort that emitted the minimum and rebuilt the remainder once per line —
+O(n) copies of the remainder per line, quadratic in the pool. Measured: a
+4,600-line, 200 KB file trapped.
 
-The numeric key is built the same way: it is a pair of substring **views**
-over the line, and it performs no concatenation at all.
+Now a top-down merge sort over byte ranges of the terminated text. A range
+is split at the line boundary nearest its middle (found by walking newlines
+from its start — one host search per line per level, which the merge pays
+anyway) and the two halves merged onto a run built with amu's **tail
+append**: `string-concat` copies only its second operand when the first is
+the pool's last allocation, so appending a line *view* to the run in
+progress costs that line's bytes. Nothing between two appends allocates —
+`string-index-of`, the views and `string-code-point-at` do not — which is
+what keeps the run at the tail. Comparisons see each line **without** its
+newline, since with it a line holding a byte below 10 (a tab) would sort
+after a line it is a prefix of.
 
-It is still O(n²) in allocations. Package with `--string-pool` and `--fuel`
-that match the file you mean to sort; the suite uses 8 MB and 50,000,000.
+Every level allocates the text once: n · log₂(lines) pool bytes, and about
+four pair handles per line per level (a dozen under `-n`, whose key is
+views). Measured 2026-09-15 on 80,000 lines / 3.4 MB, output identical to
+`LC_ALL=C /usr/bin/sort`: 1.15 s user (`-r` 1.16, `-u` 1.16, `-n` 3.16),
+where the previous guest trapped at 4,600 lines. At 770,000 lines / 33 MB it
+traps on the 64 Mi pair ceiling (52 Mi handles over 17 levels) after 5.5 s;
+the system sort takes 0.38 s there. What costs the time is the comparison:
+one `string-code-point-at` call per code point per line, and lines that
+share a long prefix pay it every level. A host-side byte comparison is the
+next lever, as the host search was for grep.
+
+The numeric key is still a pair of substring **views** over the line and
+performs no concatenation. The suite packages `--pairs 67108864
+--string-pool 268435456 --cpu-seconds 120`.
 
 ## Capabilities
 
