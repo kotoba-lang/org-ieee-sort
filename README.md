@@ -215,16 +215,24 @@ what keeps the run at the tail. Comparisons see each line **without** its
 newline, since with it a line holding a byte below 10 (a tab) would sort
 after a line it is a prefix of.
 
-Every level allocates the text once: n · log₂(lines) pool bytes, and about
-four pair handles per line per level (a dozen under `-n`, whose key is
-views). Measured 2026-09-15 on 80,000 lines / 3.4 MB, output identical to
-`LC_ALL=C /usr/bin/sort`: 1.15 s user (`-r` 1.16, `-u` 1.16, `-n` 3.16),
-where the previous guest trapped at 4,600 lines. At 770,000 lines / 33 MB it
-traps on the 64 Mi pair ceiling (52 Mi handles over 17 levels) after 5.5 s;
-the system sort takes 0.38 s there. What costs the time is the comparison:
-one `string-code-point-at` call per code point per line, and lines that
-share a long prefix pay it every level. A host-side byte comparison is the
-next lever, as the host search was for grep.
+Every level allocates the text once: n · log₂(lines) pool bytes. Handles
+(2026-09-16): **two per line per level** — the taken view and the appended
+run. Byte order compares **in place** from the two line starts
+(`line-less-from`, a newline ending a line), so no view is cut for the
+comparison, and every scalar step (`line-after`'s search view, `-n`'s two
+key views, the split's boundary walk) is a region (`arena-scope`, context
+ABI v6) released as it answers. Measured on 3.3 MB / 76,940 lines: 11.7 Mi
+handles before, 2.59 Mi after.
+
+Measured, output identical to `LC_ALL=C /usr/bin/sort`: 3.3 MB 0.95 s user
+(`-r` 0.97, `-n` 2.80); **33 MB / 769,400 lines 12.5 s** (`-u` 12.1), where
+before it trapped on the pair ceiling after 5.5 s. `-n` at 33 MB exhausts a
+4 × 10⁹ fuel budget (23 s of CPU): the numeric key walk is a function call
+per digit. The system sort takes 0.38 s on that file. What costs the time
+is the comparison — one `string-code-point-at` call per code point per
+line, and lines that share a long prefix pay it every level — so a
+host-side byte comparison is the next lever, as the host search was for
+grep.
 
 The numeric key is still a pair of substring **views** over the line and
 performs no concatenation. The suite packages `--pairs 67108864

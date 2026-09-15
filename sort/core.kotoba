@@ -99,6 +99,26 @@ b" 1 2))
 (defn less? [a :string b :string] :bool
   (less-from a b 0 0))
 
+;; The same walk over two newline-TERMINATED runs, from the line starts I
+;; and J, where a newline ends the line: a line that ends first is less, two
+;; that end together are equal. This is what the merge compares with in
+;; byte order (2026-09-16), so that no view is cut for the comparison -- a
+;; view is a pair handle, and two per line per merge level were half of
+;; what a 33 MB sort spent. Every run here ends in a newline, so neither
+;; cursor can run off its string before meeting one.
+(defn line-less-from [a :string b :string i :i64 j :i64] :bool
+  (let [ca (string-code-point-at a i)
+        cb (string-code-point-at b j)]
+    (if (= ca 10)
+      (if (= cb 10) false true)
+      (if (= cb 10)
+        false
+        (if (< ca cb)
+          true
+          (if (> ca cb)
+            false
+            (line-less-from a b (+ i (cp-width ca)) (+ j (cp-width cb)))))))))
+
 ;; --- the numeric key, for -n ---------------------------------------------
 ;;
 ;; Measured against `LC_ALL=C /usr/bin/sort -n` on 2026-09-10, one shape at a
@@ -314,9 +334,22 @@ b" 1 2))
       (string-concat acc (string-substring b j nb))
       (if (>= j nb)
         (string-concat acc (string-substring a i na))
-        (let [ea (line-after a i na)
-              eb (line-after b j nb)]
-          (if (before? (string-substring b j (- eb 1)) (string-substring a i (- ea 1)) mode)
+        ;; Every scalar step is a REGION (arena-scope, ABI v6): the search
+        ;; view `line-after` cuts and, under -n, the two key views are
+        ;; released as the step answers its number, so a merge spends two
+        ;; handles per line -- the taken view and the appended run -- and
+        ;; nothing else. Measured 2026-09-16 on 3.3 MB: 152 handles per line
+        ;; before, over 17 levels.
+        (let [ea (arena-scope (line-after a i na))
+              eb (arena-scope (line-after b j nb))]
+          ;; -n compares numeric keys built from views of the two lines;
+          ;; byte order (-r reversed) compares in place from the line starts.
+          (if (arena-scope
+               (if (= mode 2)
+                 (numeric-less? (string-substring b j (- eb 1)) (string-substring a i (- ea 1)))
+                 (if (= mode 1)
+                   (line-less-from a b i j)
+                   (line-less-from b a j i))))
             (merge-from a b (+ (* i 4294967296) eb)
                         (string-concat acc (string-substring b j eb)) mode)
             (merge-from a b (+ (* ea 4294967296) j)
@@ -329,10 +362,10 @@ b" 1 2))
 ;; sorted, as one terminated string. One line is a view; more are split at
 ;; the boundary nearest the middle and merged.
 (defn msort [s :string lo :i64 hi :i64 mode :i64] :string
-  (let [second (line-after s lo hi)]
+  (let [second (arena-scope (line-after s lo hi))]
     (if (>= second hi)
       (string-substring s lo hi)
-      (let [mid (boundary-from s second (quot (+ lo hi) 2) hi)
+      (let [mid (arena-scope (boundary-from s second (quot (+ lo hi) 2) hi))
             cut (if (>= mid hi) second mid)]
         (merge-runs (msort s lo cut mode) (msort s cut hi mode) mode)))))
 
@@ -341,11 +374,11 @@ b" 1 2))
   (let [n (string-byte-length s)]
     (if (>= i n)
       0
-      (let [e (line-after s i n)
+      (let [e (arena-scope (line-after s i n))
             line (string-substring s i (- e 1))]
         (if (if first? false (string=? line prev))
           (emit-unique s e prev false)
-          (do (emit (string-substring s i e))
+          (do (arena-scope (string-byte-length (emit (string-substring s i e))))
               (emit-unique s e line false)))))))
 
 (defn emit-sorted [s :string mode :i64] :i64
