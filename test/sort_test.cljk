@@ -15,7 +15,9 @@
 
 (defn- run [cmd args opts]
   (let [r (.spawnSync cp cmd (clj->js args)
-                      (clj->js (merge {:encoding "buffer"} opts)))]
+                      ;; The large fixture answers 3.6 MB; Node's default 1 MiB
+                      ;; maxBuffer would kill the child and call it a difference.
+                      (clj->js (merge {:encoding "buffer" :maxBuffer 67108864} opts)))]
     {:status (.-status r) :out (.-stdout r) :err (.-stderr r)}))
 
 (defn- refuse [message]
@@ -44,7 +46,16 @@
 ;;                         so this asserts what it ACTUALLY does (nothing),
 ;;                         not what POSIX says
 (def fixtures
-  {"fruit"  "banana\napple\ncherry\n"
+  {;; A LARGE file: 80,000 lines, 3.6 MB, shuffled by a fixed stride so
+   ;; every level of the merge does work, with duplicates for -u and a
+   ;; numeric key for -n. The previous core.kotoba -- a selection sort
+   ;; rebuilding its remainder per line -- trapped at 4,600 lines (measured
+   ;; 2026-09-15); this is the case that pins the merge sort.
+   "big"    (str/join "" (map (fn [i]
+                               (let [k (mod (* i 7919) 80000)]
+                                 (str (- (quot k 3) 10000) " line " (quot k 3) " of the corpus, " (mod k 4) "\n")))
+                             (range 80000)))
+   "fruit"  "banana\napple\ncherry\n"
    ;; Case is where the two locales disagree most visibly.
    "case"   "b\na\nB\nA\n"
    ;; Lexical, not numeric: 10 100 9.
@@ -156,6 +167,8 @@
 (def cases
   [["fruit"] ["case"] ["nums"] ["dup"] ["nonl"] ["utf8"] ["one"] ["empty"]
    ["prefix"] ["blank"] ["trailblank"] ["twoblank"]
+   ;; The large file under every flag.
+   ["big"] ["-r" "big"] ["-u" "big"] ["-n" "big"]
    ;; A MISSING operand: matched on stderr and exit status since wire 35
    ;; gained an EXISTS form. Every utility words this differently --
    ;; measured on each, not copied from a sibling.
@@ -220,7 +233,11 @@
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
-      packager (.join path amu-home "scripts" "package-command.cljs")]
+      ;; `.cljk`, run through amu's own kbb: the `.cljs` spelling this named
+      ;; until 2026-09-15 no longer exists (the cljk rename), so the suite
+      ;; could not have run since.
+      packager (.join path amu-home "scripts" "package-command.cljk")
+      kbb (.join path amu-home "bin" "kbb")]
   (when-not (.existsSync fs amu) (refuse (str "no amu at " amu)))
   (when-not (.existsSync fs packager) (refuse (str "no packager at " packager)))
   (when-not (.existsSync fs system-sort) (refuse (str "no " system-sort " to compare against")))
@@ -252,8 +269,13 @@
       ;; here rather than supplied at run time. Sorting walks one code point
       ;; at a time and the numeric key walks the digits again, so the guest
       ;; recursion is long and the default 512 fuel counts almost nothing.
-      (doseq [[out extra] [[exe ["--fuel" "50000000" "--string-pool" "8000000"]]]]
-        (let [p (run "nbb" (into [packager "--code" blob "--offset" offset "--isa" "aarch64"
+      ;; Budgets for the large fixture: 17 merge levels of 3.6 MB in the
+      ;; pool, four handles per line per level (a dozen under -n, whose key
+      ;; is views), and several CPU
+      ;; seconds on a loaded machine.
+      (doseq [[out extra] [[exe ["--fuel" "4000000000" "--string-pool" "268435456" "--pairs" "67108864"
+                                 "--cpu-seconds" "120" "--wall-seconds" "600"]]]]
+        (let [p (run "node" (into [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
                                   "--allow" "35,37,38,39"
                                   "--fs-scope" (.realpathSync fs (.join path tmp "data"))
                                   "--output" out]
