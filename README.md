@@ -219,7 +219,7 @@ Measured 2026-09-16, CPU seconds user, output identical to `LC_ALL=C
 | input | this sort | `-r` | `-u` | `-n` | `/usr/bin/sort` | uutils `sort` |
 |---|---|---|---|---|---|---|
 | 3.3 MB / 76,940 lines | 0.06 | — | 0.06 | 2.25 | 0.03 | 0.01 |
-| 33 MB / 769,400 lines | **0.66** | 0.67 | 0.65 | fuel-exhausted | 0.38 | 0.17 |
+| 33 MB / 769,400 lines | **0.66** | 0.67 | 0.65 | **0.87** | 0.38 | 0.17 |
 
 Text merge, same file, same day: 2.69 s; the index sort on the ABI v8
 loader 0.83 s; with context ABI v9 — kotoba-native ADR 0084 emits
@@ -227,10 +227,19 @@ loader 0.83 s; with context ABI v9 — kotoba-native ADR 0084 emits
 resolves a string once when both compared lines are in it — **0.66 s**.
 Sampled, what remains is the comparison itself (one pass, eight bytes at
 a time, in the loader) and the call around it, then the output phase's
-view and append per line. `-n` at 33 MB
-still exhausts a 4 × 10⁹ fuel budget: its key is rebuilt from views at
-every comparison, a function call per digit; a key computed once per
-line is the next lever there.
+view and append per line.
+
+`-n` computes its key **once per line** (2026-09-16): the numeric prefix
+as `sign × (integer × 1000 + fraction)` when the integer part has at most
+six significant digits and the fraction at most three, packed into the
+line's vector word beside its offset; anything wider carries a sentinel
+and is compared by the exact digit-by-digit path over views, so the order
+is the same total order as before. 33 MB: fuel-exhausted → **0.87 s**
+(`/usr/bin/sort -n` 0.79, uutils 0.43). A 200,000-line corpus mixing
+negatives, 5-digit fractions, 12-digit integers, `-0`, `+5`, `1e3`, `.5`
+and `\t7`: 2.37 s → 0.77 s, identical to `/usr/bin/sort -n` on both.
+(The first cut packed "unrepresentable" as a −1 low half, which read
+back as 2³²−1 after the shift; the corpus caught it.)
 
 ## Capabilities
 
