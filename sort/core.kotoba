@@ -11,13 +11,15 @@
 ;; was right for exactly one operand, so this asks the question that stays
 ;; right when a second operand appears.
 ;;
-;; ## No ordering primitive was needed, and that is worth stating
+;; ## The ordering is one host call (context ABI v7, 2026-09-16)
 ;;
-;; The language has no string comparison but `string=`, which is why
-;; `org-ieee-ls` records `-a` as needing "a merge into byte order" it could
-;; not do. It does not need a primitive: UTF-8 preserves code point order
-;; lexicographically, so walking both strings with `string-code-point-at` and
-;; comparing code points gives exactly byte order. `less?` below is that walk.
+;; Until 2026-09-16 the language had no string comparison but `string=`, and
+;; this walked both lines with `string-code-point-at`, one host call per
+;; code point per line per merge level -- 12.5 s of a 33 MB sort where
+;; `/usr/bin/sort` spent 0.38. `string-compare` (ABI v7, slot 240) is the
+;; loader's memcmp over the common prefix, the shorter first; UTF-8
+;; preserves code point order lexicographically, so that IS byte order,
+;; and `less?` below is one call.
 ;;
 ;; ## Byte order, so the comparison is `LC_ALL=C sort`
 ;;
@@ -70,54 +72,11 @@
   (string-substring "a
 b" 1 2))
 
-;; The UTF-8 width of the code point starting at byte offset I, from its
-;; VALUE -- the contract `string-code-point-at` states.
-(defn cp-width [c :i64] :i64
-  (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
-
-;; Is A strictly less than B in byte order? Walks both by code points; UTF-8
-;; keeps code point order and byte order the same, so this IS byte order. A
-;; proper prefix is less than what extends it.
-;;
-;; The lengths are recomputed each step rather than carried. Six parameters
-;; exceeded the native ABI's supported arity -- `function parameters exceed
-;; ABI-supported arity` -- and `string-byte-length` is a host callback, so
-;; asking twice per step costs no fuel and no arena.
-(defn less-from [a :string b :string i :i64 j :i64] :bool
-  (if (>= i (string-byte-length a))
-    (if (>= j (string-byte-length b)) false true)
-    (if (>= j (string-byte-length b))
-      false
-      (let [ca (string-code-point-at a i)
-            cb (string-code-point-at b j)]
-        (if (< ca cb)
-          true
-          (if (> ca cb)
-            false
-            (less-from a b (+ i (cp-width ca)) (+ j (cp-width cb)))))))))
-
+;; Is A strictly less than B in byte order? One host comparison (ABI v7):
+;; byte order over the common prefix, then a proper prefix is less than
+;; what extends it, which is exactly `LC_ALL=C`.
 (defn less? [a :string b :string] :bool
-  (less-from a b 0 0))
-
-;; The same walk over two newline-TERMINATED runs, from the line starts I
-;; and J, where a newline ends the line: a line that ends first is less, two
-;; that end together are equal. This is what the merge compares with in
-;; byte order (2026-09-16), so that no view is cut for the comparison -- a
-;; view is a pair handle, and two per line per merge level were half of
-;; what a 33 MB sort spent. Every run here ends in a newline, so neither
-;; cursor can run off its string before meeting one.
-(defn line-less-from [a :string b :string i :i64 j :i64] :bool
-  (let [ca (string-code-point-at a i)
-        cb (string-code-point-at b j)]
-    (if (= ca 10)
-      (if (= cb 10) false true)
-      (if (= cb 10)
-        false
-        (if (< ca cb)
-          true
-          (if (> ca cb)
-            false
-            (line-less-from a b (+ i (cp-width ca)) (+ j (cp-width cb)))))))))
+  (< (string-compare a b) 0))
 
 ;; --- the numeric key, for -n ---------------------------------------------
 ;;
@@ -220,12 +179,8 @@ b" 1 2))
     (if (char-is? d i 48) (all-zeros? d (+ i 1)) false)))
 
 ;; Two digit spans of the SAME length, left to right. -1, 0 or 1.
-(defn cmp-same-length [a :string b :string i :i64 n :i64] :i64
-  (if (>= i n)
-    0
-    (let [ca (string-code-point-at a i)
-          cb (string-code-point-at b i)]
-      (if (< ca cb) -1 (if (> ca cb) 1 (cmp-same-length a b (+ i 1) n))))))
+(defn cmp-same-length [a :string b :string] :i64
+  (string-compare a b))
 
 ;; Integer magnitudes as decimal digits: leading zeros dropped, then more
 ;; digits is more, then left to right. `007` and `7` compare equal, which is
@@ -236,7 +191,7 @@ b" 1 2))
         sb (string-substring b (skip-zeros b 0) (string-byte-length b))
         la (string-byte-length sa)
         lb (string-byte-length sb)]
-    (if (< la lb) -1 (if (> la lb) 1 (cmp-same-length sa sb 0 la)))))
+    (if (< la lb) -1 (if (> la lb) 1 (cmp-same-length sa sb)))))
 
 ;; Fractions, digit by digit, a missing digit reading as 0 -- so `1.5` and
 ;; `1.50` are equal and `1.10` is below `1.5`.
@@ -296,7 +251,7 @@ b" 1 2))
 ;; VIEWS onto the run in progress costs the bytes of the line and nothing
 ;; else. The discipline that keeps the run at the tail: nothing between two
 ;; appends may allocate -- `line-after` (one host search), the substring
-;; views and the comparisons (`string-code-point-at`) do not.
+;; views and the comparison (`string-compare`) do not.
 ;;
 ;; A range is split at a LINE boundary near its middle, found by walking
 ;; newlines from its start; that is one host search per line per level,
@@ -342,14 +297,17 @@ b" 1 2))
         ;; before, over 17 levels.
         (let [ea (arena-scope (line-after a i na))
               eb (arena-scope (line-after b j nb))]
-          ;; -n compares numeric keys built from views of the two lines;
-          ;; byte order (-r reversed) compares in place from the line starts.
+          ;; Both lines WITHOUT their newlines (with it, a line holding a
+          ;; tab would sort after a line it is a prefix of): -n compares
+          ;; the numeric keys, byte order (-r reversed) is one host
+          ;; comparison. The two views are handles cut inside this step's
+          ;; region and released as it answers its bool.
           (if (arena-scope
-               (if (= mode 2)
-                 (numeric-less? (string-substring b j (- eb 1)) (string-substring a i (- ea 1)))
-                 (if (= mode 1)
-                   (line-less-from a b i j)
-                   (line-less-from b a j i))))
+               (let [la (string-substring a i (- ea 1))
+                     lb (string-substring b j (- eb 1))]
+                 (if (= mode 2)
+                   (numeric-less? lb la)
+                   (if (= mode 1) (less? la lb) (less? lb la)))))
             (merge-from a b (+ (* i 4294967296) eb)
                         (string-concat acc (string-substring b j eb)) mode)
             (merge-from a b (+ (* ea 4294967296) j)
