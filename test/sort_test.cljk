@@ -229,7 +229,20 @@
    ["-n" "trailblank"] ["-n" "dup"]
    ;; -n across operands, including the unterminated one.
    ["-n" "nbasic" "nums"] ["-n" "nonl" "nbasic"] ["-n" "nmixed" "fruit"]
-   ["-n" "missing"] ["-n" "nbasic" "missing"]])
+   ["-n" "missing"] ["-n" "nbasic" "missing"]
+   ;; --- standard input (wire 41, 2026-09-16) ---------------------------
+   ;; 97% of sort's invocations in agent tool use are a later pipeline
+   ;; segment (6,046 of 6,208 measured); `sort | uniq` alone is 1,889.
+   {:argv [] :stdin "fruit"}
+   {:argv ["-r"] :stdin "fruit"}
+   {:argv ["-u"] :stdin "dup"}
+   {:argv ["-n"] :stdin "nbasic"}
+   {:argv [] :stdin "nonl"}
+   {:argv [] :stdin "empty"}
+   ;; The 3.6 MB fixture through the pipe: past one pipe buffer, and the
+   ;; merge sort over stdin the way it runs over a file.
+   {:argv [] :stdin "big"}
+   {:argv ["-n"] :stdin "big"}])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
@@ -247,7 +260,7 @@
         kexe (.join path tmp "sort.kexe")
         blob (.join path tmp "sort.bin")
         exe (.join path tmp "sort")]
-    (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39]}}" "utf8")
+    (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39] [:cap/call 41]}}" "utf8")
     ;; The fixtures live in the tree the binary is packaged for. The native
     ;; loader refuses a relative request outright, so operands are absolute.
     (let [data (.join path tmp "data")]
@@ -278,7 +291,7 @@
                                  "--vector-items" "4194304"
                                  "--cpu-seconds" "120" "--wall-seconds" "600"]]]]
         (let [p (run "node" (into [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
-                                  "--allow" "35,37,38,39"
+                                  "--allow" "35,37,38,39,41"
                                   "--fs-scope" (.realpathSync fs (.join path tmp "data"))
                                   "--output" out]
                                  extra) {})]
@@ -286,7 +299,7 @@
     ;; Now the only thing that matters: run it.
     (let [data (.realpathSync fs (.join path tmp "data"))
           results
-          (for [names cases]
+          (for [case cases]
             ;; EVERY operand is a path, and every FLAG is not. This took only
             ;; `(first names)` until 2026-09-10, which silently dropped the
             ;; rest -- the twelve multi-operand cases added that day all
@@ -295,20 +308,30 @@
             ;; rather than the status: `["fruit" "nums"]` printed fruit's
             ;; three lines with none of nums', and `["fruit" "missing"]`
             ;; printed instead of failing.
-            (let [argv (mapv #(if (flag? %) % (.join path data %)) names)
-                  k (run exe argv {})
+            (let [names (if (map? case) (:argv case) case)
+                  ;; A map case names a fixture fed as standard input to BOTH
+                  ;; binaries; as a Buffer, since spawnSync applies :encoding
+                  ;; "buffer" to a string input and node refuses it.
+                  input (when (map? case)
+                          (or (get fixtures (:stdin case))
+                              (refuse (str "no fixture " (:stdin case) " for a stdin case"))))
+                  opts (if input {:input (js/Buffer.from input "utf8")} {})
+                  argv (mapv #(if (flag? %) % (.join path data %)) names)
+                  k (run exe argv opts)
                   ;; LC_ALL=C: byte order. See the header.
                   s (run system-sort argv
-                         {:env (let [e (js/Object.assign #js {} (.-env js/process))]
-                                 (aset e "LC_ALL" "C")
-                                 e)})
+                         (assoc opts
+                                :env (let [e (js/Object.assign #js {} (.-env js/process))]
+                                       (aset e "LC_ALL" "C")
+                                       e)))
                   same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
                              ;; stderr too: a missing operand differs there
                              ;; and nowhere else, so a suite that compared
                              ;; only stdout and status would call it green.
                              (= (.toString (:err k) "base64") (.toString (:err s) "base64"))
                              (= (:status k) (:status s)))]
-              {:argv names :ok same? :kotoba (.toString (:out k) "utf8")
+              {:argv (if (map? case) [(:argv case) :stdin (:stdin case)] names)
+               :ok same? :kotoba (.toString (:out k) "utf8")
                :system (.toString (:out s) "utf8")
                :exit [(:status k) (:status s)]}))
           bad (remove :ok results)]
