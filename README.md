@@ -192,68 +192,45 @@ are the distinct values `""` and `"\n"`. It costs the same two
 concatenations. `append-join` restores the old form and fails exactly the
 three `-r` cases with an empty line.
 
-## Merge sort on the loader's tail append (2026-09-15)
+## The lines are never moved until they are written (index sort, 2026-09-16)
 
-Substrings are **views** and cost no arena bytes; `string-concat` is what
-allocates, and the arena never reclaims. The first shape was a selection
-sort that emitted the minimum and rebuilt the remainder once per line —
-O(n) copies of the remainder per line, quadratic in the pool. Measured: a
-4,600-line, 200 KB file trapped.
+A vector holds the byte offset where each line starts; a bottom-up merge
+sort orders the **offsets** between two vectors written in place
+(`vector-assoc!`, one store per element per level); the sorted text is
+appended from the offsets at the end, a thousand lines per region. A
+comparison is one host call over the two lines in place
+(`string-compare-lines`, context ABI v8, newline excluded — with it a
+line holding a tab would sort after a line it is a prefix of); only `-n`
+cuts views, for its numeric keys, inside a region. The loader's default
+**4,096 handles** suffice; what the command is packaged with is
+`--vector-items`, two words per line, and the line count is what bounds
+the file it can sort.
 
-Now a top-down merge sort over byte ranges of the terminated text. A range
-is split at the line boundary nearest its middle (found by walking newlines
-from its start — one host search per line per level, which the merge pays
-anyway) and the two halves merged onto a run built with amu's **tail
-append**: `string-concat` copies only its second operand when the first is
-the pool's last allocation, so appending a line *view* to the run in
-progress costs that line's bytes. Nothing between two appends allocates —
-`string-index-of`, the views and `string-compare` do not — which is
-what keeps the run at the tail. Comparisons see each line **without** its
-newline, since with it a line holding a byte below 10 (a tab) would sort
-after a line it is a prefix of.
+What made this possible is `kotoba.kir.value/vector-item-limit` moving
+from 16,384 to 2^24 (osaho #93, owner decision 2026-09-16) and amu's
+vector arenas becoming per-run budgets. Before it, a merge sort over the
+**text** rebuilt the whole file at every level with the tail append and
+searched every line end again (2026-09-15 → 09-16: selection sort that
+trapped at 4,600 lines → text merge 12.5 s → ABI v7 3.0 s → ABI v8 2.69 s).
 
-Every level allocates the text once: n · log₂(lines) pool bytes. Handles
-(2026-09-16): **two per line per level** that outlive a step — the taken
-view and the appended run. Every scalar step (`line-after`'s search view,
-the two line views the comparison is made over, `-n`'s key views, the
-split's boundary walk) is a region (`arena-scope`, context ABI v6)
-released as it answers. Measured on 3.3 MB / 76,940 lines: 11.7 Mi
-handles before the regions, 2.59 Mi after.
+Measured 2026-09-16, CPU seconds user, output identical to `LC_ALL=C
+/usr/bin/sort` and to uutils `sort` (Rust):
 
-Measured 2026-09-16, output identical to `LC_ALL=C /usr/bin/sort`, CPU
-seconds user:
+| input | this sort | `-r` | `-u` | `-n` | `/usr/bin/sort` | uutils `sort` |
+|---|---|---|---|---|---|---|
+| 3.3 MB / 76,940 lines | 0.06 | — | 0.06 | 2.25 | 0.03 | 0.01 |
+| 33 MB / 769,400 lines | **0.66** | 0.67 | 0.65 | fuel-exhausted | 0.38 | 0.17 |
 
-| input | this sort | `-r` | `-u` | `-n` | `LC_ALL=C /usr/bin/sort` |
-|---|---|---|---|---|---|
-| 3.3 MB / 76,940 lines | 0.26 | 0.26 | 0.26 | 2.16 | 0.03 |
-| 33 MB / 769,400 lines | 3.00 | — | 3.06 | fuel-exhausted | 0.36 |
-
-On context ABI v8 (2026-09-16), the merge's line ends are one host search
-from an offset each (`string-index-of-from`, no view) and byte order is
-**one host comparison of the two lines in place** (`string-compare-lines`,
-the line of A at I against the line of B at J, newline excluded): 33 MB
-**2.69 s** (`-r` 2.78, `-u` 2.90), identical to `LC_ALL=C /usr/bin/sort`
-(0.36) and to uutils `sort` (Rust, 0.16). Sampled, the run is now memchr
-(the newline searches: two per line per level plus the split's walk) and
-`string-substring` (the newline needle is a literal, a handle per
-evaluation — which is why each search is still a region: without it the
-33 MB run exhausted 64 Mi handles on needles alone).
-
-Before ABI v7 the 33 MB sort took 12.5 s. Two things moved it: the
-comparison became one host call (above), and amu's loader `memmem` behind
-`string-index-of` — which the merge asks for the next newline once per
-line per level — had been calling `memcmp` at every haystack offset, a
-function call per byte, sampled at 54% of the run; it is now `memchr` for
-the first byte and one `memcmp` per candidate (amu 2026-09-16). Of the
-remaining 3.0 s about a third is `string-substring` (five views per line
-per level), the rest the search, the append and the region marks. `-n` at
-33 MB still exhausts a 4 × 10⁹ fuel budget (19 s of CPU): the numeric key
-walk is a function call per digit, and `string-skip-blank` (ABI v7) is not
-its blank skip — `-n` skips space and tab only, measured above.
-
-The numeric key is still a pair of substring **views** over the line and
-performs no concatenation. The suite packages `--pairs 67108864
---string-pool 268435456 --cpu-seconds 120`.
+Text merge, same file, same day: 2.69 s; the index sort on the ABI v8
+loader 0.83 s; with context ABI v9 — kotoba-native ADR 0084 emits
+`vector-at` / `vector-assoc!` / `vector-count` in line, and the loader
+resolves a string once when both compared lines are in it — **0.66 s**.
+Sampled, what remains is the comparison itself (one pass, eight bytes at
+a time, in the loader) and the call around it, then the output phase's
+view and append per line. `-n` at 33 MB
+still exhausts a 4 × 10⁹ fuel budget: its key is rebuilt from views at
+every comparison, a function call per digit; a key computed once per
+line is the next lever there.
 
 ## Capabilities
 

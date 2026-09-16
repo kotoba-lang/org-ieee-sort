@@ -238,123 +238,153 @@ b" 1 2))
   (let [c (cmp-numeric a b)]
     (if (< c 0) true (if (> c 0) false (less? a b)))))
 
-;; --- merge sort over the terminated text ---------------------------------
+;; --- index merge sort (2026-09-16) -----------------------------------------
 ;;
-;; Until 2026-09-15 this was a selection sort that rebuilt the remainder by
-;; `string-concat` once per line: O(n) concatenations per line, each copying
-;; the whole remainder, so the pool was spent quadratically -- measured,
-;; 4,600 lines (200 KB) trapped. Now a top-down merge sort over byte ranges
-;; of the terminated text. Every level allocates the text once (the merged
-;; runs), so the pool holds n * log2(lines) bytes, and each merge builds its
-;; run with the loader's TAIL APPEND: `string-concat` copies only its second
-;; operand when the first is the pool's last allocation, so appending line
-;; VIEWS onto the run in progress costs the bytes of the line and nothing
-;; else. The discipline that keeps the run at the tail: nothing between two
-;; appends may allocate -- `line-after` (one host search), the substring
-;; views and the comparison (`string-compare`) do not.
+;; The lines are never moved until they are written. A vector holds the
+;; byte offset where each line starts (`fill`), a bottom-up merge sort
+;; orders the OFFSETS between two vectors written in place
+;; (`vector-assoc!`, one store per element per level), and the sorted
+;; text is appended from the offsets at the end, a thousand lines per
+;; region. A comparison is one host call over the two lines in place
+;; (`string-compare-lines`, context ABI v8, newline excluded -- with it a
+;; line holding a tab would sort after a line it is a prefix of); only
+;; -n cuts views, for its numeric keys, inside a region.
 ;;
-;; A range is split at a LINE boundary near its middle, found by walking
-;; newlines from its start; that is one host search per line per level,
-;; which the merge pays anyway. Comparisons see each line WITHOUT its
-;; newline: with it, a line holding a byte below 10 (a tab) would sort after
-;; a line it is a prefix of.
+;; Until 2026-09-16 this was a merge sort over the TEXT: every level
+;; rebuilt the whole file with the tail append and searched every line end
+;; again, about eleven host calls per line per level -- 2.69 s on 33 MB
+;; where the index sort takes 0.77 (uutils sort 0.19, /usr/bin/sort
+;; 0.36). Before that a selection sort trapped at 4,600 lines. What made
+;; the index sort possible is `vector-item-limit` moving from 16,384 to
+;; 2^24 (osaho #93) and the loader's vector arenas becoming per-run
+;; budgets: this command is packaged with `--vector-items` for two words
+;; per line, and the line count is what bounds the file it can sort.
+;;
+;; A function carries five parameters, so the merge packs its cursors:
+;; II = i * 2^20 + iend, JJ = mode * 2^41 + j * 2^20 + jend (a line index
+;; below 2^20, the item limit's order of magnitude for two vectors).
 
-;; The offset just past the newline that ends the line containing I, or HI.
-(defn line-after [s :string i :i64 hi :i64] :i64
-  ;; One host search from I (`string-index-of-from`, context ABI v8) --
-  ;; until 2026-09-16 a view was cut to search from an offset, a handle
-  ;; and a region per line per level. The search runs to the end of S, so
-  ;; a newline at or past HI means none in [I, HI).
-  ;; A REGION still: the newline needle is a literal, and a literal is a
-  ;; handle each time it is evaluated -- measured 2026-09-16, the 33 MB
-  ;; sort exhausted 64 Mi handles on needles alone once the region here
-  ;; was dropped.
+;; Just past the newline ending the line at I, or N. A region: the needle
+;; is a literal, a handle each time it is evaluated.
+(defn line-after [s :string i :i64 n :i64] :i64
   (let [k (arena-scope (string-index-of-from s (nl) i))]
-    (if (< k 0) hi (if (>= k hi) hi (+ k 1)))))
+    (if (< k 0) n (+ k 1))))
 
-;; The first line boundary at or after byte offset MID, walking from I.
-(defn boundary-from [s :string i :i64 mid :i64 hi :i64] :i64
-  (if (>= i mid) i (boundary-from s (line-after s i hi) mid hi)))
+(defn count-lines [text :string pos :i64 n :i64 acc :i64] :i64
+  (if (>= pos n) acc (count-lines text (line-after text pos n) n (+ acc 1))))
+
+(defn- fill [text :string v :vector-i64 k :i64 pos :i64] :vector-i64
+  (let [n (string-byte-length text)]
+    (if (>= pos n)
+      v
+      (fill text (vector-assoc! v k pos) (+ k 1) (line-after text pos n)))))
 
 ;; --- the order ------------------------------------------------------------
 ;;
 ;; mode 0 = ascending byte order   mode 2 = -n
 ;;      1 = -r                          3 = -u (ascending; -u is a filter)
-(defn before? [a :string b :string mode :i64] :bool
+;; Does the line at SB go before the line at SA? Stable: a line of the first
+;; run goes first unless the second run's is strictly before it.
+(defn take-second? [text :string sa :i64 sb :i64 mode :i64] :bool
   (if (= mode 2)
-    (numeric-less? a b)
-    (if (= mode 1) (less? b a) (less? a b))))
+    (arena-scope
+     (let [n (string-byte-length text)
+           ea (line-after text sa n)
+           eb (line-after text sb n)]
+       (numeric-less? (string-substring text sb (- eb 1))
+                      (string-substring text sa (- ea 1)))))
+    (if (= mode 1)
+      (< (string-compare-lines text sa text sb) 0)
+      (< (string-compare-lines text sb text sa) 0))))
 
-;; Merge the sorted runs A and B onto ACC. IJ packs the two cursors,
-;; `i * 2^32 + j`, because a function here carries at most five parameters.
-;; Stable: a line of A goes first unless B's is strictly before it.
-(defn merge-from [a :string b :string ij :i64 acc :string mode :i64] :string
-  (let [i (quot ij 4294967296)
-        j (- ij (* 4294967296 i))
-        na (string-byte-length a)
-        nb (string-byte-length b)]
-    (if (>= i na)
-      (string-concat acc (string-substring b j nb))
-      (if (>= j nb)
-        (string-concat acc (string-substring a i na))
-        ;; A merge step spends two handles per line -- the taken view and
-        ;; the appended run -- and nothing else: the line ends are host
-        ;; searches (no view) and byte order is ONE host comparison of the
-        ;; two lines in place (`string-compare-lines`, context ABI v8: the
-        ;; line of A at I against the line of B at J, each up to its
-        ;; newline -- with the newline, a line holding a tab would sort
-        ;; after a line it is a prefix of; the head excludes it). Only -n
-        ;; cuts views, for its numeric keys, inside a region (arena-scope,
-        ;; ABI v6) released as the step answers its bool. Measured
-        ;; 2026-09-16 on 3.3 MB: 152 handles per line before the regions,
-        ;; over 17 levels.
-        (let [ea (line-after a i na)
-              eb (line-after b j nb)]
-          (if (if (= mode 2)
-                (arena-scope
-                 (numeric-less? (string-substring b j (- eb 1))
-                                (string-substring a i (- ea 1))))
-                (if (= mode 1)
-                  (< (string-compare-lines a i b j) 0)
-                  (< (string-compare-lines b j a i) 0)))
-            (merge-from a b (+ (* i 4294967296) eb)
-                        (string-concat acc (string-substring b j eb)) mode)
-            (merge-from a b (+ (* ea 4294967296) j)
-                        (string-concat acc (string-substring a i ea)) mode)))))))
+;; Merge src[i, iend) and src[j, jend) into dst from k = i + j - iend.
+(defn- merge-runs [text :string src :vector-i64 dst :vector-i64 ii :i64 jj :i64] :vector-i64
+  (let [i (i64-shift-right ii 20)
+        iend (bit-and ii 1048575)
+        j (bit-and (i64-shift-right jj 20) 1048575)
+        jend (bit-and jj 1048575)
+        mode (i64-shift-right jj 41)
+        k (- (+ i j) iend)]
+    (if (>= i iend)
+      (if (>= j jend)
+        dst
+        (merge-runs text src (vector-assoc! dst k (vector-at src j)) ii (+ jj 1048576)))
+      (if (>= j jend)
+        (merge-runs text src (vector-assoc! dst k (vector-at src i)) (+ ii 1048576) jj)
+        (if (take-second? text (vector-at src i) (vector-at src j) mode)
+          (merge-runs text src (vector-assoc! dst k (vector-at src j)) ii (+ jj 1048576))
+          (merge-runs text src (vector-assoc! dst k (vector-at src i)) (+ ii 1048576) jj))))))
 
-(defn merge-runs [a :string b :string mode :i64] :string
-  (merge-from a b 0 (string-substring a 0 0) mode))
+;; One pass of width W over N lines: LW = lo * 2^24 + w, NM = n * 4 + mode.
+(defn- pass [text :string src :vector-i64 dst :vector-i64 lw :i64 nm :i64] :vector-i64
+  (let [lo (i64-shift-right lw 24)
+        w (bit-and lw 16777215)
+        n (i64-shift-right nm 2)
+        mode (bit-and nm 3)
+        mid (if (> (+ lo w) n) n (+ lo w))
+        hi (if (> (+ lo (* 2 w)) n) n (+ lo (* 2 w)))]
+    (if (>= lo n)
+      dst
+      (pass text src
+            (merge-runs text src dst (+ (i64-shift-left lo 20) mid)
+                        (+ (i64-shift-left mode 41) (i64-shift-left mid 20) hi))
+            (+ (i64-shift-left hi 24) w) nm))))
 
-;; The lines in S[LO, HI) -- LO a line boundary, HI just past a newline --
-;; sorted, as one terminated string. One line is a view; more are split at
-;; the boundary nearest the middle and merged.
-(defn msort [s :string lo :i64 hi :i64 mode :i64] :string
-  (let [second (line-after s lo hi)]
-    (if (>= second hi)
-      (string-substring s lo hi)
-      (let [mid (boundary-from s second (quot (+ lo hi) 2) hi)
-            cut (if (>= mid hi) second mid)]
-        (merge-runs (msort s lo cut mode) (msort s cut hi mode) mode)))))
+(defn- passes [text :string src :vector-i64 dst :vector-i64 w :i64 nm :i64] :vector-i64
+  (if (>= w (i64-shift-right nm 2))
+    src
+    (passes text (pass text src dst w nm) src (* 2 w) nm)))
 
-;; -u: the sorted text with adjacent duplicates dropped, written as it goes.
-(defn emit-unique [s :string i :i64 prev :string first? :bool] :i64
-  (let [n (string-byte-length s)]
-    (if (>= i n)
+;; --- the output -----------------------------------------------------------
+;;
+;; The sorted text, appended from the offsets a thousand lines per region:
+;; a line costs two handles (its view and its append), so the batch is
+;; bounded by LINES, not bytes -- a sorted C file starts with thousands of
+;; one-byte lines, which is how a byte bound trapped at 4,096 handles.
+;; Under -u a line equal to the one before it (`string-compare-lines`, in
+;; place) is skipped. PREV is the previous emitted line's offset, or -1.
+(defn- emit-from [text :string v :vector-i64 k :i64 end :i64 acc :string] :string
+  (if (>= k end)
+    acc
+    (let [pos (vector-at v k)
+          e (line-after text pos (string-byte-length text))]
+      (emit-from text v (+ k 1) end (string-concat acc (string-substring text pos e))))))
+
+(defn- emit-unique-from [text :string v :vector-i64 k :i64 pe :i64 acc :string] :string
+  ;; PE = prev * 2^21 + end; prev < 2^20 is an INDEX into V, 2^20 means none.
+  (let [prev (i64-shift-right pe 21)
+        end (bit-and pe 2097151)]
+    (if (>= k end)
+      acc
+      (let [pos (vector-at v k)
+            e (line-after text pos (string-byte-length text))]
+        (if (if (= prev 1048576) false (= 0 (string-compare-lines text (vector-at v prev) text pos)))
+          (emit-unique-from text v (+ k 1) pe acc)
+          (emit-unique-from text v (+ k 1) (+ (i64-shift-left k 21) end)
+                            (string-concat acc (string-substring text pos e))))))))
+
+(defn- emit-batch [text :string v :vector-i64 k :i64 end :i64 mode :i64] :i64
+  (do (emit (if (= mode 3)
+              (emit-unique-from text v k (+ (i64-shift-left (if (= k 0) 1048576 (- k 1)) 21) end) "")
+              (emit-from text v k end "")))
+      end))
+
+(defn- emit-all [text :string v :vector-i64 k :i64 nm :i64] :i64
+  (let [n (i64-shift-right nm 2)]
+    (if (>= k n)
       0
-      (let [e (line-after s i n)
-            line (string-substring s i (- e 1))]
-        (if (if first? false (string=? line prev))
-          (emit-unique s e prev false)
-          (do (arena-scope (string-byte-length (emit (string-substring s i e))))
-              (emit-unique s e line false)))))))
+      (emit-all text v
+                (arena-scope (emit-batch text v k (if (> (+ k 1024) n) n (+ k 1024)) (bit-and nm 3)))
+                nm))))
 
 (defn emit-sorted [s :string mode :i64] :i64
-  (if (= (string-byte-length s) 0)
-    0
-    (let [sorted (msort s 0 (string-byte-length s) mode)]
-      (if (= mode 3)
-        (emit-unique sorted 0 sorted true)
-        (do (emit sorted) 0)))))
+  (let [n (string-byte-length s)]
+    (if (= n 0)
+      0
+      (let [lines (count-lines s 0 n 0)
+            nm (+ (* lines 4) mode)
+            sorted (passes s (fill s (vector-alloc lines) 0 0) (vector-alloc lines) 1 nm)]
+        (emit-all s sorted 0 nm)))))
 
 ;; There is no trim of the final newline, and its ABSENCE is deliberate.
 ;;
