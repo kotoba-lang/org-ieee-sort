@@ -269,11 +269,13 @@
       ;; here rather than supplied at run time. Sorting walks one code point
       ;; at a time and the numeric key walks the digits again, so the guest
       ;; recursion is long and the default 512 fuel counts almost nothing.
-      ;; Budgets for the large fixture: 17 merge levels of 3.6 MB in the
-      ;; pool, four handles per line per level (a dozen under -n, whose key
-      ;; is views), and several CPU
-      ;; seconds on a loaded machine.
-      (doseq [[out extra] [[exe ["--fuel" "4000000000" "--string-pool" "268435456" "--pairs" "67108864"
+      ;; Budgets for the large fixture (index sort, 2026-09-16): the text
+      ;; plus the answer in the pool, two vector words per line (the
+      ;; offsets, sorted between two vectors), the loader's DEFAULT 4,096
+      ;; handles -- every step is a region -- and several CPU seconds on a
+      ;; loaded machine.
+      (doseq [[out extra] [[exe ["--fuel" "4000000000" "--string-pool" "268435456" "--pairs" "4096"
+                                 "--vector-items" "4194304"
                                  "--cpu-seconds" "120" "--wall-seconds" "600"]]]]
         (let [p (run "node" (into [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
                                   "--allow" "35,37,38,39"
