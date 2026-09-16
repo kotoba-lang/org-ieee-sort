@@ -228,6 +228,17 @@ seconds user:
 | 3.3 MB / 76,940 lines | 0.26 | 0.26 | 0.26 | 2.16 | 0.03 |
 | 33 MB / 769,400 lines | 3.00 | — | 3.06 | fuel-exhausted | 0.36 |
 
+On context ABI v8 (2026-09-16), the merge's line ends are one host search
+from an offset each (`string-index-of-from`, no view) and byte order is
+**one host comparison of the two lines in place** (`string-compare-lines`,
+the line of A at I against the line of B at J, newline excluded): 33 MB
+**2.69 s** (`-r` 2.78, `-u` 2.90), identical to `LC_ALL=C /usr/bin/sort`
+(0.36) and to uutils `sort` (Rust, 0.16). Sampled, the run is now memchr
+(the newline searches: two per line per level plus the split's walk) and
+`string-substring` (the newline needle is a literal, a handle per
+evaluation — which is why each search is still a region: without it the
+33 MB run exhausted 64 Mi handles on needles alone).
+
 Before ABI v7 the 33 MB sort took 12.5 s. Two things moved it: the
 comparison became one host call (above), and amu's loader `memmem` behind
 `string-index-of` — which the merge asks for the next newline once per
