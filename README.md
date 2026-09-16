@@ -13,20 +13,17 @@ to a standalone native executable.
 **One flag, and it is argument 0.** Combining them (`-rn`, `-r -u`, `-nu`) is
 out of scope and is not implemented — see *What this is not*.
 
-## No ordering primitive was needed
+## The ordering is one host call (context ABI v7, 2026-09-16)
 
-The language has no string comparison but `string=`, which is why
-[`org-ieee-ls`](https://github.com/kotoba-lang/org-ieee-ls) records `-a` as
-needing "a merge into byte order" it could not do.
-
-It does not need a primitive. **UTF-8 preserves code point order
-lexicographically**, so walking both strings with `string-code-point-at` and
-comparing code points *is* byte order. `less?` is that walk, and it is
-ordinary guest code.
-
-(It carries four parameters, not six. Six was `function parameters exceed
-ABI-supported arity`; the two string lengths are recomputed each step
-instead, which costs nothing — `string-byte-length` is a host callback.)
+Until 2026-09-16 the language had no string comparison but `string=`
+(which is why [`org-ieee-ls`](https://github.com/kotoba-lang/org-ieee-ls)
+records `-a` as needing "a merge into byte order" it could not do), and
+`less?` walked both lines with `string-code-point-at` — one host call per
+code point per line per merge level. **UTF-8 preserves code point order
+lexicographically**, so that walk *was* byte order, and so is what
+replaced it: `string-compare` (amu context ABI v7, slot 240) is the
+loader's `memcmp` over the common prefix, the shorter first. `less?` is
+one call.
 
 ## Byte order, so the comparison is `LC_ALL=C sort`
 
@@ -210,29 +207,38 @@ anyway) and the two halves merged onto a run built with amu's **tail
 append**: `string-concat` copies only its second operand when the first is
 the pool's last allocation, so appending a line *view* to the run in
 progress costs that line's bytes. Nothing between two appends allocates —
-`string-index-of`, the views and `string-code-point-at` do not — which is
+`string-index-of`, the views and `string-compare` do not — which is
 what keeps the run at the tail. Comparisons see each line **without** its
 newline, since with it a line holding a byte below 10 (a tab) would sort
 after a line it is a prefix of.
 
 Every level allocates the text once: n · log₂(lines) pool bytes. Handles
-(2026-09-16): **two per line per level** — the taken view and the appended
-run. Byte order compares **in place** from the two line starts
-(`line-less-from`, a newline ending a line), so no view is cut for the
-comparison, and every scalar step (`line-after`'s search view, `-n`'s two
-key views, the split's boundary walk) is a region (`arena-scope`, context
-ABI v6) released as it answers. Measured on 3.3 MB / 76,940 lines: 11.7 Mi
-handles before, 2.59 Mi after.
+(2026-09-16): **two per line per level** that outlive a step — the taken
+view and the appended run. Every scalar step (`line-after`'s search view,
+the two line views the comparison is made over, `-n`'s key views, the
+split's boundary walk) is a region (`arena-scope`, context ABI v6)
+released as it answers. Measured on 3.3 MB / 76,940 lines: 11.7 Mi
+handles before the regions, 2.59 Mi after.
 
-Measured, output identical to `LC_ALL=C /usr/bin/sort`: 3.3 MB 0.95 s user
-(`-r` 0.97, `-n` 2.80); **33 MB / 769,400 lines 12.5 s** (`-u` 12.1), where
-before it trapped on the pair ceiling after 5.5 s. `-n` at 33 MB exhausts a
-4 × 10⁹ fuel budget (23 s of CPU): the numeric key walk is a function call
-per digit. The system sort takes 0.38 s on that file. What costs the time
-is the comparison — one `string-code-point-at` call per code point per
-line, and lines that share a long prefix pay it every level — so a
-host-side byte comparison is the next lever, as the host search was for
-grep.
+Measured 2026-09-16, output identical to `LC_ALL=C /usr/bin/sort`, CPU
+seconds user:
+
+| input | this sort | `-r` | `-u` | `-n` | `LC_ALL=C /usr/bin/sort` |
+|---|---|---|---|---|---|
+| 3.3 MB / 76,940 lines | 0.26 | 0.26 | 0.26 | 2.16 | 0.03 |
+| 33 MB / 769,400 lines | 3.00 | — | 3.06 | fuel-exhausted | 0.36 |
+
+Before ABI v7 the 33 MB sort took 12.5 s. Two things moved it: the
+comparison became one host call (above), and amu's loader `memmem` behind
+`string-index-of` — which the merge asks for the next newline once per
+line per level — had been calling `memcmp` at every haystack offset, a
+function call per byte, sampled at 54% of the run; it is now `memchr` for
+the first byte and one `memcmp` per candidate (amu 2026-09-16). Of the
+remaining 3.0 s about a third is `string-substring` (five views per line
+per level), the rest the search, the append and the region marks. `-n` at
+33 MB still exhausts a 4 × 10⁹ fuel budget (19 s of CPU): the numeric key
+walk is a function call per digit, and `string-skip-blank` (ABI v7) is not
+its blank skip — `-n` skips space and tab only, measured above.
 
 The numeric key is still a pair of substring **views** over the line and
 performs no concatenation. The suite packages `--pairs 67108864
