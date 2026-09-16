@@ -219,12 +219,15 @@ Measured 2026-09-16, CPU seconds user, output identical to `LC_ALL=C
 | input | this sort | `-r` | `-u` | `-n` | `/usr/bin/sort` | uutils `sort` |
 |---|---|---|---|---|---|---|
 | 3.3 MB / 76,940 lines | 0.06 | — | 0.06 | 2.25 | 0.03 | 0.01 |
-| 33 MB / 769,400 lines | **0.66** | 0.67 | 0.65 | **0.87** | 0.38 | 0.17 |
+| 33 MB / 769,400 lines | **0.62** | 0.63 | 0.64 | **0.86** | 0.38 | 0.17 |
 
 Text merge, same file, same day: 2.69 s; the index sort on the ABI v8
 loader 0.83 s; with context ABI v9 — kotoba-native ADR 0084 emits
 `vector-at` / `vector-assoc!` / `vector-count` in line, and the loader
-resolves a string once when both compared lines are in it — **0.66 s**.
+resolves a string once when both compared lines are in it — 0.66 s; with
+context ABI v10 (the line ends found as a byte, `string-find-byte`, and
+the output appended as ranges, `string-append-range`, no needle handle and
+no view per line) — **0.62 s**.
 Sampled, what remains is the comparison itself (one pass, eight bytes at
 a time, in the loader) and the call around it, then the output phase's
 view and append per line.

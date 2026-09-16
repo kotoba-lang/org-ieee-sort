@@ -267,7 +267,7 @@ b" 1 2))
 ;; Just past the newline ending the line at I, or N. A region: the needle
 ;; is a literal, a handle each time it is evaluated.
 (defn line-after [s :string i :i64 n :i64] :i64
-  (let [k (arena-scope (string-index-of-from s (nl) i))]
+  (let [k (string-find-byte s 10 i)]
     (if (< k 0) n (+ k 1))))
 
 (defn count-lines [text :string pos :i64 n :i64 acc :i64] :i64
@@ -438,7 +438,7 @@ b" 1 2))
     acc
     (let [pos (item-pos (vector-at v k))
           e (line-after text pos (string-byte-length text))]
-      (emit-from text v (+ k 1) end (string-concat acc (string-substring text pos e))))))
+      (emit-from text v (+ k 1) end (string-append-range acc text pos e)))))
 
 (defn- emit-unique-from [text :string v :vector-i64 k :i64 pe :i64 acc :string] :string
   ;; PE = prev * 2^21 + end; prev < 2^20 is an INDEX into V, 2^20 means none.
@@ -451,7 +451,7 @@ b" 1 2))
         (if (if (= prev 1048576) false (= 0 (string-compare-lines text (item-pos (vector-at v prev)) text pos)))
           (emit-unique-from text v (+ k 1) pe acc)
           (emit-unique-from text v (+ k 1) (+ (i64-shift-left k 21) end)
-                            (string-concat acc (string-substring text pos e))))))))
+                            (string-append-range acc text pos e)))))))
 
 (defn- emit-batch [text :string v :vector-i64 k :i64 end :i64 mode :i64] :i64
   (do (emit (if (= mode 3)
