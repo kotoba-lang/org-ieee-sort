@@ -567,13 +567,16 @@ b" 1 2))
 (defn first-operand [] :i64
   (if (flagged?) 1 0))
 
+(defn stdin [n :string] :string
+  (typed-cap-call :io/read :string :string n))
+
 (defn main [] :i64
   (let [total (arg "")]
     (if (string=? total "0")
-      ;; No operand. POSIX reads standard input; there is no stdin
-      ;; capability, so this refuses rather than pretending to have read an
-      ;; empty one.
-      2
+      ;; No operand: standard input, whole (wire 41, 2026-09-16 -- 97% of
+      ;; sort's invocations in agent tool use are a later pipeline segment).
+      ;; Input past the string pool is refused, never sorted short.
+      (emit-sorted (terminated (stdin "")) 0)
       (let [mode (mode-of)
             start (first-operand)]
         (if (< mode 0)
@@ -582,9 +585,8 @@ b" 1 2))
             (emit-error (nl))
             2)
           (if (string=? (decimal-of start) total)
-            ;; A flag and no operand: stdin again, and refused for the same
-            ;; reason.
-            2
+            ;; A flag and no operand: standard input again.
+            (emit-sorted (terminated (stdin "")) mode)
             (if (all-readable? start total)
               (emit-sorted (gather start total "") mode)
               ;; `sort: No such file or directory`, exit 2. sort names NO path

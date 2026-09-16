@@ -288,12 +288,14 @@ Measured again with each flag: `sort -r nope`, `sort -u nope` and
 - **No combined flags.** `-rn`, `-nu`, `-r -u` and `-un` are out of scope.
   Argument 0 is one of `-r`, `-u`, `-n` or it is an operand.
 - **No `-k`, `-t`, `-f`, `-b`, `-c`, `-m`, `-o`, `-s`, `-g`, `-h`, `-V`.**
-- **No reading standard input.** With no operand — and with a flag and no
-  operand — this exits 2 rather than pretending to have read an empty one.
-  There is no stdin capability. This is also why there is no test case for
-  it: `spawnSync` closes the child's stdin, so `/usr/bin/sort` would see EOF
-  and succeed, and the two would be answering different questions.
-- **`-` is not standard input** either; it is rejected as an unknown flag.
+- **Standard input is read when there is no operand** (wire 41 `:io/read`,
+  2026-09-16) — with or without a flag. 97% of `sort`'s invocations in agent
+  tool use are a later pipeline segment (6,046 of 6,208 over 1,268,018
+  measured Bash calls; `sort | uniq` alone is 1,889). Whole-input form: input
+  larger than the binary's string pool is refused (exit 120), never sorted
+  short. The suite feeds fixtures — including the 3.6 MB one — to both
+  binaries as stdin.
+- **`-` is not standard input**; it is rejected as an unknown flag.
 - **An unknown flag is not reproduced byte for byte.** `/usr/bin/sort -x`
   exits 2 with `sort: invalid option -- x` followed by the whole BSD `Usage:`
   block, and `--bogus` words it differently again. That block is a
