@@ -287,6 +287,13 @@ Measured again with each flag: `sort -r nope`, `sort -u nope` and
 
 - **No combined flags.** `-rn`, `-nu`, `-r -u` and `-un` are out of scope.
   Argument 0 is one of `-r`, `-u`, `-n` or it is an operand.
+- **Flags combine** (2026-09-17): `-rn`, `-nr`, `-r -n`, `-rnu` — any
+  spelling of the set {r, n, u}. `sort -rn` is 1,031 of the measured agent
+  calls and was refused while `-r` and `-n` alone were accepted. Under `-nu`
+  numerically equal lines are one line (`1`, `1.0`, `01`; any two
+  non-numbers) and the one kept is the *first in input order* — `-u` makes
+  the numeric comparison stable, where plain `-n` tiebreaks equal keys by
+  bytes. Both measured on `/usr/bin/sort` and pinned.
 - **No `-k`, `-t`, `-f`, `-b`, `-c`, `-m`, `-o`, `-s`, `-g`, `-h`, `-V`.**
 - **Standard input is read when there is no operand** (wire 41 `:io/read`,
   2026-09-16) — with or without a flag. 97% of `sort`'s invocations in agent

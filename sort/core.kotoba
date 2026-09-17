@@ -358,34 +358,48 @@ b" 1 2))
 
 ;; --- the order ------------------------------------------------------------
 ;;
-;; mode 0 = ascending byte order   mode 2 = -n
-;;      1 = -r                          3 = -u (ascending; -u is a filter)
+;; MODE is a bit set since 2026-09-17: 1 = -r, 2 = -n, 4 = -u, in any
+;; combination -- `sort -rn` is 1,031 of the measured agent calls and was
+;; refused as an unknown flag while `-r` and `-n` alone were accepted.
+;; Three bits, so NM = n * 8 + mode and JJ carries the mode at bit 41.
 ;; Does the line at SB go before the line at SA? Stable: a line of the first
 ;; run goes first unless the second run's is strictly before it.
 ;; ITEM-A / ITEM-B are the vector words: an offset, or under -n the key
 ;; and the offset packed. A key equal on both sides is the whole-line
 ;; tiebreak, in place; a sentinel on either side is the exact digit path.
-(defn take-second? [text :string item-a :i64 item-b :i64 mode :i64] :bool
-  (let [sa (item-pos item-a)
-        sb (item-pos item-b)]
-    (if (= mode 2)
-      (let [ka (item-key item-a)
-            kb (item-key item-b)]
-        (if (if (= ka (key-sentinel)) true (= kb (key-sentinel)))
+;; Is the line of ITEM-X strictly before the line of ITEM-Y in the BASE
+;; order (numeric under -n, bytes otherwise)? -r reverses by swapping the
+;; two, which keeps the merge stable: equal lines stay in input order.
+;; Under -n, equal keys are tiebroken by bytes -- `sort -n` of b, a is a, b
+;; -- EXCEPT under -u, where equal keys are one line and the FIRST IN INPUT
+;; ORDER is the one kept: `sort -nu` of b, a is b (measured 2026-09-17 on
+;; /usr/bin/sort; also 1.0, 1, 01 -> 1.0). So -u makes the numeric
+;; comparison stable: NOTIE? skips the byte tiebreak.
+(defn- base-less? [text :string item-x :i64 item-y :i64 numeric? :bool notie? :bool] :bool
+  (let [sx (item-pos item-x)
+        sy (item-pos item-y)]
+    (if numeric?
+      (let [kx (item-key item-x)
+            ky (item-key item-y)]
+        (if (if (= kx (key-sentinel)) true (= ky (key-sentinel)))
           (arena-scope
            (let [n (string-byte-length text)
-                 ea (line-after text sa n)
-                 eb (line-after text sb n)]
-             (numeric-less? (string-substring text sb (- eb 1))
-                            (string-substring text sa (- ea 1)))))
-          (if (< kb ka)
+                 ex (line-after text sx n)
+                 ey (line-after text sy n)
+                 a (string-substring text sx (- ex 1))
+                 b (string-substring text sy (- ey 1))]
+             (if notie? (< (cmp-numeric a b) 0) (numeric-less? a b))))
+          (if (< kx ky)
             true
-            (if (> kb ka)
+            (if (> kx ky)
               false
-              (< (string-compare-lines text sb text sa) 0)))))
-      (if (= mode 1)
-        (< (string-compare-lines text sa text sb) 0)
-        (< (string-compare-lines text sb text sa) 0)))))
+              (if notie? false (< (string-compare-lines text sx text sy) 0))))))
+      (< (string-compare-lines text sx text sy) 0))))
+
+(defn take-second? [text :string item-a :i64 item-b :i64 mode :i64] :bool
+  (if (= 1 (bit-and mode 1))
+    (base-less? text item-a item-b (= 2 (bit-and mode 2)) (= 4 (bit-and mode 4)))
+    (base-less? text item-b item-a (= 2 (bit-and mode 2)) (= 4 (bit-and mode 4)))))
 
 ;; Merge src[i, iend) and src[j, jend) into dst from k = i + j - iend.
 (defn- merge-runs [text :string src :vector-i64 dst :vector-i64 ii :i64 jj :i64] :vector-i64
@@ -409,8 +423,8 @@ b" 1 2))
 (defn- pass [text :string src :vector-i64 dst :vector-i64 lw :i64 nm :i64] :vector-i64
   (let [lo (i64-shift-right lw 24)
         w (bit-and lw 16777215)
-        n (i64-shift-right nm 2)
-        mode (bit-and nm 3)
+        n (i64-shift-right nm 3)
+        mode (bit-and nm 7)
         mid (if (> (+ lo w) n) n (+ lo w))
         hi (if (> (+ lo (* 2 w)) n) n (+ lo (* 2 w)))]
     (if (>= lo n)
@@ -421,7 +435,7 @@ b" 1 2))
             (+ (i64-shift-left hi 24) w) nm))))
 
 (defn- passes [text :string src :vector-i64 dst :vector-i64 w :i64 nm :i64] :vector-i64
-  (if (>= w (i64-shift-right nm 2))
+  (if (>= w (i64-shift-right nm 3))
     src
     (passes text (pass text src dst w nm) src (* 2 w) nm)))
 
@@ -440,31 +454,57 @@ b" 1 2))
           e (line-after text pos (string-byte-length text))]
       (emit-from text v (+ k 1) end (string-append-range acc text pos e)))))
 
+;; Are the items EQUAL for -u? Under -n two lines are one when neither is
+;; numerically before the other (`1`, `1.0` and `01` are one line, and so
+;; are every two non-numbers -- measured, `sort -nu` of `b` and `a` prints
+;; `b`); otherwise byte-equal. The mode rides in PE's bit 20 (prev is an
+;; index under 2^20; 2^20 means none).
+(defn- same-for-unique? [text :string item-p :i64 item-q :i64 numeric? :bool] :bool
+  (if numeric?
+    ;; The KEY alone -- numeric-less? tiebreaks equal keys by bytes, which
+    ;; is right for ordering and wrong here: `a` and `b` are one line to -nu.
+    (let [kp (item-key item-p)
+          kq (item-key item-q)]
+      (if (if (= kp (key-sentinel)) true (= kq (key-sentinel)))
+        (arena-scope
+         (let [n (string-byte-length text)
+               sp (item-pos item-p)
+               sq (item-pos item-q)
+               ep (line-after text sp n)
+               eq (line-after text sq n)]
+           (= 0 (cmp-numeric (string-substring text sp (- ep 1))
+                             (string-substring text sq (- eq 1))))))
+        (= kp kq)))
+    (= 0 (string-compare-lines text (item-pos item-p) text (item-pos item-q)))))
+
 (defn- emit-unique-from [text :string v :vector-i64 k :i64 pe :i64 acc :string] :string
-  ;; PE = prev * 2^21 + end; prev < 2^20 is an INDEX into V, 2^20 means none.
-  (let [prev (i64-shift-right pe 21)
+  ;; PE = prev * 2^22 + numeric * 2^21 + end; prev < 2^20 is an INDEX into V,
+  ;; 2^20 means none.
+  (let [prev (i64-shift-right pe 22)
+        numeric? (= 1 (bit-and (i64-shift-right pe 21) 1))
         end (bit-and pe 2097151)]
     (if (>= k end)
       acc
       (let [pos (item-pos (vector-at v k))
             e (line-after text pos (string-byte-length text))]
-        (if (if (= prev 1048576) false (= 0 (string-compare-lines text (item-pos (vector-at v prev)) text pos)))
+        (if (if (= prev 1048576) false (same-for-unique? text (vector-at v prev) (vector-at v k) numeric?))
           (emit-unique-from text v (+ k 1) pe acc)
-          (emit-unique-from text v (+ k 1) (+ (i64-shift-left k 21) end)
+          (emit-unique-from text v (+ k 1) (+ (i64-shift-left k 22) (+ (i64-shift-left (if numeric? 1 0) 21) end))
                             (string-append-range acc text pos e)))))))
 
 (defn- emit-batch [text :string v :vector-i64 k :i64 end :i64 mode :i64] :i64
-  (do (emit (if (= mode 3)
-              (emit-unique-from text v k (+ (i64-shift-left (if (= k 0) 1048576 (- k 1)) 21) end) "")
+  (do (emit (if (= 4 (bit-and mode 4))
+              (emit-unique-from text v k (+ (i64-shift-left (if (= k 0) 1048576 (- k 1)) 22)
+                                            (+ (i64-shift-left (if (= 2 (bit-and mode 2)) 1 0) 21) end)) "")
               (emit-from text v k end "")))
       end))
 
 (defn- emit-all [text :string v :vector-i64 k :i64 nm :i64] :i64
-  (let [n (i64-shift-right nm 2)]
+  (let [n (i64-shift-right nm 3)]
     (if (>= k n)
       0
       (emit-all text v
-                (arena-scope (emit-batch text v k (if (> (+ k 1024) n) n (+ k 1024)) (bit-and nm 3)))
+                (arena-scope (emit-batch text v k (if (> (+ k 1024) n) n (+ k 1024)) (bit-and nm 7)))
                 nm))))
 
 (defn emit-sorted [s :string mode :i64] :i64
@@ -472,8 +512,8 @@ b" 1 2))
     (if (= n 0)
       0
       (let [lines (count-lines s 0 n 0)
-            nm (+ (* lines 4) mode)
-            filled (if (= mode 2) (fill-keyed s (vector-alloc lines) 0 0) (fill s (vector-alloc lines) 0 0))
+            nm (+ (* lines 8) mode)
+            filled (if (= 2 (bit-and mode 2)) (fill-keyed s (vector-alloc lines) 0 0) (fill s (vector-alloc lines) 0 0))
             sorted (passes s filled (vector-alloc lines) 1 nm)]
         (emit-all s sorted 0 nm)))))
 
@@ -555,17 +595,39 @@ b" 1 2))
 ;; system utility answers that with `sort: invalid option -- x` followed by
 ;; its whole Usage block, which is a BSD-version-specific string this does not
 ;; try to reproduce; see the README.
+;; The bits of one flag argument's letters (after the dash); -1 for a letter
+;; this does not have.
+(defn- letters-bits [a :string i :i64 acc :i64] :i64
+  (if (>= i (string-byte-length a))
+    acc
+    (let [c (string-code-point-at a i)]
+      (if (= c 114) (letters-bits a (+ i 1) (bit-or acc 1))
+        (if (= c 110) (letters-bits a (+ i 1) (bit-or acc 2))
+          (if (= c 117) (letters-bits a (+ i 1) (bit-or acc 4))
+            -1))))))
+
+;; Every leading dash argument contributes: `-rn`, `-r -n`, `-nru` all mean
+;; the same set. A lone `-` is not a flag.
+(defn- flags-from [i :i64 acc :i64] :i64
+  (let [a (arg (decimal-of i))]
+    (if (if (string=? (decimal-of i) (arg "")) true (not (= (string-index-of a "-") 0)))
+      acc
+      (if (< (string-byte-length a) 2)
+        -1
+        (let [bits (letters-bits a 1 0)]
+          (if (< bits 0) -1 (flags-from (+ i 1) (bit-or acc bits))))))))
+
 (defn mode-of [] :i64
-  (if (flagged?)
-    (if (string=? (arg "0") "-r")
-      1
-      (if (string=? (arg "0") "-n")
-        2
-        (if (string=? (arg "0") "-u") 3 -1)))
-    0))
+  (flags-from 0 0))
+
+(defn- first-operand-from [i :i64] :i64
+  (let [a (arg (decimal-of i))]
+    (if (if (string=? (decimal-of i) (arg "")) true (not (= (string-index-of a "-") 0)))
+      i
+      (first-operand-from (+ i 1)))))
 
 (defn first-operand [] :i64
-  (if (flagged?) 1 0))
+  (first-operand-from 0))
 
 (defn stdin [n :string] :string
   (typed-cap-call :io/read :string :string n))
