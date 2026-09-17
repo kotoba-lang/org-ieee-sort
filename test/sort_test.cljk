@@ -92,6 +92,7 @@
    ;; --- -n, one measured shape per fixture -------------------------------
    ;; Ordinary numbers, where the numeric and the lexical order disagree.
    "nbasic" "10\n9\n100\n2\n"
+   "nsame"  "1\n1.0\n01\nb\n2\na\n"
    ;; Lines that are not numbers at all: key 0, then the whole-line
    ;; tiebreak. `apple` and `banana` come out in byte order and not in input
    ;; order, which is also the proof that -n is not stable.
@@ -242,7 +243,17 @@
    ;; The 3.6 MB fixture through the pipe: past one pipe buffer, and the
    ;; merge sort over stdin the way it runs over a file.
    {:argv [] :stdin "big"}
-   {:argv ["-n"] :stdin "big"}])
+   {:argv ["-n"] :stdin "big"}
+   ;; --- combined flags (2026-09-17) ---------------------------------------
+   ;; `sort -rn` is 1,031 of the measured agent calls; it was an unknown
+   ;; flag here while -r and -n alone were fine. Every spelling of the set.
+   ["-rn" "nbasic"] ["-nr" "nbasic"] ["-r" "-n" "nbasic"] ["-rn" "nmixed"] ["-rn" "nonl"]
+   ["-ru" "dup"] ["-ur" "dup"] ["-nu" "nbasic"] ["-rnu" "nbasic"] ["-nru" "dup"]
+   ["-rn" "nbasic" "nums"] ["-rn" "missing"] ["-r" "-u" "-n" "nbasic"]
+   {:argv ["-rn"] :stdin "nbasic"} {:argv ["-rn"] :stdin "big"} {:argv ["-ru"] :stdin "dup"}
+   ;; -nu: numerically equal lines are ONE line (1, 1.0, 01; and any two
+   ;; non-numbers).
+   {:argv ["-nu"] :stdin "nsame"} {:argv ["-rnu"] :stdin "nsame"} {:argv ["-nu"] :stdin "fruit"}])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
